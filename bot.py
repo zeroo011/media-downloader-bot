@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import yt_dlp
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 
@@ -754,6 +755,77 @@ def format_speed_eta(speed_str: str, eta_str: str) -> str:
             parts.append(f"⏳ {human_eta}")
     return " • ".join(parts)
 
+async def get_video_codec(filepath: str) -> str:
+    """Определяет кодек видеопотока через ffprobe (h264, vp9, av1 и т.д.)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            filepath,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode().strip().lower()
+    except Exception as e:
+        logging.warning(f"Failed to get video codec for {filepath}: {e}")
+        return ""
+
+async def ensure_h264(filepath: str, status_msg: Message | None = None) -> str:
+    """Проверяет кодек видео. Если не H.264 (например, VP9/AV1), быстро перекодирует в H.264 (-c:a copy) для предотвращения черного экрана на смартфонах. Возвращает итоговый путь к файлу."""
+    if not os.path.exists(filepath):
+        return filepath
+    codec = await get_video_codec(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if codec == "h264" and ext == ".mp4":
+        return filepath
+
+    logging.info(f"Видео {filepath} (кодек '{codec}', ext '{ext}') требует оптимизации в H.264 MP4...")
+    if status_msg:
+        try:
+            await status_msg.edit_text("⚙️ Оптимизирую видео для Telegram (H.264)...")
+        except Exception:
+            pass
+
+    dest_mp4 = os.path.splitext(filepath)[0] + "_h264.mp4"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", filepath,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "copy",
+        "-threads", str(FFMPEG_THREADS),
+        dest_mp4,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        preexec_fn=os.setsid
+    )
+    try:
+        await proc.wait()
+        if proc.returncode == 0 and os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 0:
+            if filepath != dest_mp4 and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+            logging.info(f"Видео {dest_mp4} успешно оптимизировано в H.264.")
+            return dest_mp4
+        else:
+            if os.path.exists(dest_mp4):
+                try:
+                    os.remove(dest_mp4)
+                except OSError:
+                    pass
+            return filepath
+    except Exception as e:
+        logging.warning(f"Ошибка перекодирования H.264: {e}")
+        if os.path.exists(dest_mp4):
+            try:
+                os.remove(dest_mp4)
+            except OSError:
+                pass
+        return filepath
+
 # --- ПРЯМЫЕ МЕДИА ССЫЛКИ И СОЦСЕТИ (REDDIT, PINTEREST, TWITTER) ---
 
 DIRECT_MEDIA_EXTENSIONS = (
@@ -1365,33 +1437,33 @@ async def process_download_job(job: DownloadJob):
                 max_web_approx = max(40, int(MAX_FILE_SIZE_MB * 0.90))
 
                 if is_youtube and job.audio_format_id:
-                    # Пользователь выбрал конкретную аудиодорожку (H.264 для избежания черного экрана)
+                    # Приоритет качества: 1080p -> 720p. До 480p/360p опускаемся ТОЛЬКО если 720p превышает 200 МБ
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height<=1080]+{job.audio_format_id}/"
-                        f"bestvideo[vcodec^=avc][height<=720]+{job.audio_format_id}/"
-                        f"bestvideo[vcodec^=avc]+{job.audio_format_id}/"
-                        f"bestvideo[height<=1080]+{job.audio_format_id}/"
-                        f"bestvideo+{job.audio_format_id}/"
+                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{job.audio_format_id}/"
+                        f"bestvideo[height=1080][filesize_approx<190M]+{job.audio_format_id}/"
+                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height=720][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height=720]+{job.audio_format_id}/"
+                        f"bestvideo[height<=1080][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height<=720]+{job.audio_format_id}/"
+                        f"bestvideo[height<=480][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height<=360]+{job.audio_format_id}/"
                         f"{job.audio_format_id}/"
                         "best"
                     )
                 elif is_youtube:
-                    # YouTube видео без ручного выбора дорожки: умный отбор русской или оригинальной дорожки + H.264
+                    # YouTube видео без ручного выбора дорожки (одиночный трек)
                     audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height>=1000][filesize_approx<46M]+{audio_subrule}/"
-                        f"best[height>=1000][filesize<47M]/"
-                        f"bestvideo[vcodec^=avc][height>=700][height<1000][filesize_approx<46M]+{audio_subrule}/"
-                        f"best[height>=700][height<1000][filesize<47M]/"
-                        f"bestvideo[vcodec^=avc][height<=1080][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+{audio_subrule}/"
-                        f"best[height<=1080][filesize<{max_web_size}M]/"
-                        f"bestvideo[vcodec^=avc][height<=720][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+{audio_subrule}/"
-                        f"best[height<=720][filesize<{max_web_size}M]/"
-                        f"bestvideo[vcodec^=avc][height<=480][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+{audio_subrule}/"
-                        f"best[height<=480][filesize<{max_web_size}M]/"
-                        f"bestvideo[vcodec^=avc]+{audio_subrule}/"
-                        f"bestvideo[height<=1080]+{audio_subrule}/"
-                        f"best[filesize<{max_web_size}M]/"
+                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{audio_subrule}/"
+                        f"bestvideo[height=1080][filesize_approx<190M]+{audio_subrule}/"
+                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height=720][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height=720]+{audio_subrule}/"
+                        f"bestvideo[height<=1080][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height<=720]+{audio_subrule}/"
+                        f"bestvideo[height<=480][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height<=360]+{audio_subrule}/"
                         "best"
                     )
                 else:
@@ -1636,6 +1708,7 @@ async def process_download_job(job: DownloadJob):
         # 2. Обычные видео
         if videos:
             for vid in videos:
+                vid = await ensure_h264(vid, status_msg=job.status_msg)
                 file_size = os.path.getsize(vid)
                 file_size_mb = round(file_size / (1024 * 1024), 1)
 
@@ -2936,11 +3009,15 @@ async def download_for_inline(url: str) -> dict | None:
             if is_youtube:
                 audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                 format_rule = (
-                    f"bestvideo[vcodec^=avc][height<=720][ext=mp4]+{audio_subrule}/"
-                    f"bestvideo[vcodec^=avc][height<=720]+{audio_subrule}/"
-                    f"bestvideo[height<=720][ext=mp4]+{audio_subrule}/"
+                    f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{audio_subrule}/"
+                    f"bestvideo[height=1080][filesize_approx<190M]+{audio_subrule}/"
+                    f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height=720][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height=720]+{audio_subrule}/"
+                    f"bestvideo[height<=1080][filesize_approx<195M]+{audio_subrule}/"
                     f"bestvideo[height<=720]+{audio_subrule}/"
-                    "best[height<=720]/"
+                    f"bestvideo[height<=480][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height<=360]+{audio_subrule}/"
                     "best"
                 )
             else:
@@ -3075,7 +3152,8 @@ async def download_for_inline(url: str) -> dict | None:
         # 2. Если есть видео (одиночное или смешанная публикация)
         elif videos:
             video_items = []
-            for idx, vid in enumerate(videos[:10]):
+            for idx, raw_vid in enumerate(videos[:10]):
+                vid = await ensure_h264(raw_vid)
                 item_token = f"{token}_{idx:02d}"
                 raw_base = os.path.splitext(os.path.basename(vid))[0]
                 # Очистка названия от системных спецсимволов для безопасного сохранения
