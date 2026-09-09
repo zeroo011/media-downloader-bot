@@ -50,7 +50,7 @@ WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 # Лимиты и квоты для безопасности диска и производительности
 MAX_TG_FILE_SIZE_BYTES = 49 * 1024 * 1024        # 49 МБ (лимит отправки Telegram Bot API)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "250"))
-MAX_WEB_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024      # Лимит для веб-скачивания (по умолчанию 250 МБ)
+MAX_WEB_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MB * 1.15 * 1024 * 1024)      # Лимит для веб-скачивания с допуском 15%
 WEB_TTL_SECONDS = int(os.getenv("WEB_TTL_SECONDS", str(7 * 60)))                         # 7 минут для веб-ссылок
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(4 * 60)))                       # 4 минуты для кнопок MP3/Кружочек
 
@@ -103,6 +103,7 @@ class DownloadJob:
     duration: float | None = None
     timeout: float | None = None
     max_height: int | None = None
+    video_format_id: str | None = None
 
 def calculate_job_timeout(duration: float | None) -> float:
     """Рассчитывает динамический таймаут на основе длительности медиа."""
@@ -822,6 +823,45 @@ async def get_video_codec(filepath: str) -> str:
         logging.warning(f"Failed to get video codec for {filepath}: {e}")
         return ""
 
+async def remux_to_mp4(filepath: str, timeout: float = 60.0) -> str:
+    """Быстрый ремуксинг видеопотоков в MP4 без перекодирования (-c copy) для веб-раздачи (> 50 МБ)."""
+    if not os.path.exists(filepath):
+        return filepath
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".mp4":
+        return filepath
+    dest_mp4 = os.path.splitext(filepath)[0] + "_remux.mp4"
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", filepath,
+        "-c", "copy",
+        dest_mp4,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        preexec_fn=os.setsid
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        if proc.returncode == 0 and os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 0:
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            return dest_mp4
+    except Exception as e:
+        logging.warning(f"remux_to_mp4 error: {e}")
+        if proc and proc.returncode is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                await proc.wait()
+            except Exception:
+                pass
+        if os.path.exists(dest_mp4):
+            try:
+                os.remove(dest_mp4)
+            except OSError:
+                pass
+    return filepath
+
 async def ensure_h264(filepath: str, status_msg: Message | None = None, timeout: float = 300.0) -> str:
     """Проверяет кодек видео. Если не H.264 (например, VP9/AV1), перекодирует в H.264 (-c:a copy) с пресетом ultrafast. Если уже H.264, делает быстрое копирование (-c copy) при необходимости. Возвращает итоговый путь к файлу."""
     if not os.path.exists(filepath):
@@ -1534,22 +1574,40 @@ async def process_download_job(job: DownloadJob):
                 max_web_size = max(45, int(MAX_FILE_SIZE_MB * 0.95))
                 max_web_approx = max(40, int(MAX_FILE_SIZE_MB * 0.90))
 
-                if is_youtube and job.audio_format_id:
-                    # Приоритет AVC/H.264 для мгновенной склейки без перекодирования!
+                if is_youtube and job.video_format_id and job.audio_format_id:
+                    # Точный выбор проверенных видео- и аудиопотоков без слепого подбора!
+                    format_rule = f"{job.video_format_id}+{job.audio_format_id}"
+                elif is_youtube and job.video_format_id:
+                    # Точный видеопоток + автоподбор аудиодорожки (русский/оригинал/лучший)
+                    audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
+                    format_rule = f"{job.video_format_id}+{audio_subrule}"
+                elif is_youtube and job.audio_format_id:
+                    # Фоллбэк: если video_format_id не был определен заранее
                     h = job.max_height or 1080
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height<={h}]+{job.audio_format_id}/"
+                        f"bestvideo[height={h}][vcodec^=avc][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height={h}][vcodec^=avc][filesize_approx<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height={h}][vcodec^=vp9][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height={h}][vcodec*=\"vp09\"][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height={h}][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height<={h}][vcodec^=avc][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
+                        f"bestvideo[height<={h}][filesize<{MAX_FILE_SIZE_MB}M]+{job.audio_format_id}/"
                         f"bestvideo[height<={h}]+{job.audio_format_id}/"
                         f"best[height<={h}]/"
                         f"bestvideo+{job.audio_format_id}/"
                         "best"
                     )
                 elif is_youtube:
-                    # YouTube видео без ручного выбора дорожки (одиночный трек)
                     h = job.max_height or 1080
                     audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height<={h}]+{audio_subrule}/"
+                        f"bestvideo[height={h}][vcodec^=avc][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height={h}][vcodec^=avc][filesize_approx<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height={h}][vcodec^=vp9][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height={h}][vcodec*=\"vp09\"][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height={h}][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height<={h}][vcodec^=avc][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
+                        f"bestvideo[height<={h}][filesize<{MAX_FILE_SIZE_MB}M]+{audio_subrule}/"
                         f"bestvideo[height<={h}]+{audio_subrule}/"
                         f"best[height<={h}]/"
                         f"bestvideo+{audio_subrule}/"
@@ -1806,7 +1864,17 @@ async def process_download_job(job: DownloadJob):
         if videos:
             for vid in videos:
                 job_timeout = job.timeout or calculate_job_timeout(job.duration)
-                vid = await ensure_h264(vid, status_msg=job.status_msg, timeout=max(60.0, job_timeout - 40.0))
+                initial_size = os.path.getsize(vid) if os.path.exists(vid) else 0
+
+                # Для файлов веб-раздачи (> 50 МБ) категорически запрещено транскодирование в libx264:
+                # браузеры и плееры нативно поддерживают VP9, а перекодирование раздует размер и нагрузит CPU.
+                # Выполняем только быстрый ремуксинг без перекодирования (-c copy).
+                if initial_size > 49 * 1024 * 1024:
+                    vid = await remux_to_mp4(vid, timeout=60.0)
+                else:
+                    # Транскодирование в H.264 применяем ТОЛЬКО для файлов <= 49 МБ для чата Telegram:
+                    vid = await ensure_h264(vid, status_msg=job.status_msg, timeout=max(60.0, job_timeout - 40.0))
+
                 try:
                     await job.status_msg.edit_text("🚀 Отправляю...")
                 except Exception:
@@ -2368,8 +2436,8 @@ def _extract_youtube_info_sync(url: str) -> dict | None:
         logging.warning(f"_extract_youtube_info_sync error: {e}")
         return None
 
-def _estimate_format_size(f: dict, duration: float | None) -> int | None:
-    """Безопасно рассчитывает примерный размер формата в байтах."""
+def _estimate_format_size(f: dict, duration: float | None, is_youtube: bool = True) -> int | None:
+    """Безопасно рассчитывает примерный размер формата в байтах с учетом VBR-коэффициента."""
     if not isinstance(f, dict):
         return None
     sz = f.get("filesize") or f.get("filesize_approx")
@@ -2381,18 +2449,19 @@ def _estimate_format_size(f: dict, duration: float | None) -> int | None:
     except (ValueError, TypeError):
         tbr_val = 0.0
     if tbr_val > 0 and duration and duration > 0:
-        return int(tbr_val * 1024 / 8 * duration)
+        factor = 0.78 if is_youtube else 1.0
+        return int(tbr_val * 1024 / 8 * duration * factor)
     return None
 
-async def get_youtube_media_options(url: str) -> tuple[str, list[dict], dict | None, dict[int, float | None], float | None, bool]:
+async def get_youtube_media_options(url: str) -> tuple[str, list[dict], dict | None, dict[int, dict], float | None, bool]:
     """
     Анализирует метаданные YouTube без скачивания.
     Возвращает (title, tracks, default_track, filtered_qualities, duration, has_oversize_only):
     - tracks: список альтернативных дорожек (если доступно > 1)
     - default_track: дорожка по умолчанию (оригинал)
-    - filtered_qualities: словарь {height: approx_total_mb} для разрешений <= MAX_FILE_SIZE_MB
+    - filtered_qualities: словарь {height: {"size_mb": float, "format_id": str, "vcodec": str}}
     - duration: длительность видео в секундах
-    - has_oversize_only: True, если форматы есть, но все превышают MAX_FILE_SIZE_MB
+    - has_oversize_only: True, если форматы есть, но все превышают MAX_FILE_SIZE_MB * 1.15
     """
     try:
         info = await asyncio.to_thread(_extract_youtube_info_sync, url)
@@ -2500,7 +2569,9 @@ async def get_youtube_media_options(url: str) -> tuple[str, list[dict], dict | N
             tracks.sort(key=sort_key)
 
     # 2. Анализ видеопотоков по целевым разрешениям [1080, 720, 480, 360]
-    raw_qualities: dict[int, float | None] = {}
+    raw_qualities: dict[int, dict] = {}
+    max_allowed_mb = MAX_FILE_SIZE_MB * 1.15  # Допуск 15%
+
     for target_h in [1080, 720, 480, 360]:
         candidates = [
             f for f in formats
@@ -2510,25 +2581,90 @@ async def get_youtube_media_options(url: str) -> tuple[str, list[dict], dict | N
         ]
         if not candidates:
             continue
-        avc_cands = [f for f in candidates if (f.get("vcodec") or "").startswith("avc")]
-        chosen = avc_cands[0] if avc_cands else candidates[0]
-        v_size = _estimate_format_size(chosen, duration)
-        if v_size is not None:
-            total_mb = round((v_size + best_audio_sz) / (1024 * 1024), 1)
-        else:
-            total_mb = None
-        raw_qualities[target_h] = total_mb
 
-    filtered_qualities: dict[int, float | None] = {}
+        avc_cands = [f for f in candidates if (f.get("vcodec") or "").lower().startswith("avc")]
+        vp9_cands = [f for f in candidates if "vp" in (f.get("vcodec") or "").lower()]
+        other_cands = [f for f in candidates if f not in avc_cands and f not in vp9_cands]
+
+        chosen_entry = None
+
+        # 1. Приоритет AVC (H.264) для мгновенной склейки без транскодирования
+        for f in avc_cands:
+            v_sz = _estimate_format_size(f, duration)
+            if v_sz is not None:
+                tot_mb = (v_sz + best_audio_sz) / (1024 * 1024)
+                if tot_mb <= max_allowed_mb:
+                    chosen_entry = {
+                        "size_mb": round(tot_mb, 1),
+                        "format_id": str(f.get("format_id")),
+                        "vcodec": f.get("vcodec")
+                    }
+                    break
+
+        # 2. Если AVC превышает лимит или отсутствует -> проверяем VP9 (на 25-35% компактнее)
+        if not chosen_entry:
+            for f in vp9_cands:
+                v_sz = _estimate_format_size(f, duration)
+                if v_sz is not None:
+                    tot_mb = (v_sz + best_audio_sz) / (1024 * 1024)
+                    if tot_mb <= max_allowed_mb:
+                        chosen_entry = {
+                            "size_mb": round(tot_mb, 1),
+                            "format_id": str(f.get("format_id")),
+                            "vcodec": f.get("vcodec")
+                        }
+                        break
+
+        # 3. Если и VP9 не уложился -> проверяем другие (AV1 и т.д.)
+        if not chosen_entry:
+            for f in other_cands:
+                v_sz = _estimate_format_size(f, duration)
+                if v_sz is not None:
+                    tot_mb = (v_sz + best_audio_sz) / (1024 * 1024)
+                    if tot_mb <= max_allowed_mb:
+                        chosen_entry = {
+                            "size_mb": round(tot_mb, 1),
+                            "format_id": str(f.get("format_id")),
+                            "vcodec": f.get("vcodec")
+                        }
+                        break
+
+        # 4. Если ничего не подошло под лимит -> берем самый компактный для информации
+        if not chosen_entry:
+            scored = []
+            for f in candidates:
+                v_sz = _estimate_format_size(f, duration)
+                if v_sz is not None:
+                    tot_mb = (v_sz + best_audio_sz) / (1024 * 1024)
+                    scored.append((tot_mb, f))
+            if scored:
+                scored.sort(key=lambda x: x[0])
+                best_fit = scored[0]
+                chosen_entry = {
+                    "size_mb": round(best_fit[0], 1),
+                    "format_id": str(best_fit[1].get("format_id")),
+                    "vcodec": best_fit[1].get("vcodec")
+                }
+            else:
+                chosen_entry = {
+                    "size_mb": None,
+                    "format_id": str(candidates[0].get("format_id")),
+                    "vcodec": candidates[0].get("vcodec")
+                }
+
+        raw_qualities[target_h] = chosen_entry
+
+    filtered_qualities: dict[int, dict] = {}
     oversize_count = 0
-    for h, sz in raw_qualities.items():
+    for h, entry in raw_qualities.items():
+        sz = entry.get("size_mb")
         if sz is not None:
-            if sz <= MAX_FILE_SIZE_MB:
-                filtered_qualities[h] = sz
+            if sz <= max_allowed_mb:
+                filtered_qualities[h] = entry
             else:
                 oversize_count += 1
         else:
-            filtered_qualities[h] = None
+            filtered_qualities[h] = entry
 
     has_oversize_only = (len(raw_qualities) > 0 and len(filtered_qualities) == 0 and oversize_count > 0)
 
@@ -2542,16 +2678,20 @@ def format_quality_label(height: int, size_mb: float | None) -> str:
         return f"{icon} {height}p (~{size_mb} МБ)"
     return f"{icon} {height}p"
 
-def build_youtube_quality_keyboard(session_id: str, qualities: dict[int, float | None]) -> InlineKeyboardMarkup:
+def build_youtube_quality_keyboard(session_id: str, qualities: dict[int, dict]) -> InlineKeyboardMarkup:
     """Генерирует инлайн-клавиатуру выбора качества видео."""
     rows = []
     sorted_heights = sorted(qualities.keys(), reverse=True)
     if not sorted_heights:
         return InlineKeyboardMarkup(inline_keyboard=[])
 
+    def _size_of(h):
+        val = qualities.get(h)
+        return val.get("size_mb") if isinstance(val, dict) else val
+
     if 1080 in sorted_heights:
         rows.append([InlineKeyboardButton(
-            text=format_quality_label(1080, qualities[1080]),
+            text=format_quality_label(1080, _size_of(1080)),
             callback_data=f"ytqual:{session_id}:1080"
         )])
         remaining = [h for h in sorted_heights if h != 1080]
@@ -2561,7 +2701,7 @@ def build_youtube_quality_keyboard(session_id: str, qualities: dict[int, float |
     pair = []
     for h in remaining:
         pair.append(InlineKeyboardButton(
-            text=format_quality_label(h, qualities[h]),
+            text=format_quality_label(h, _size_of(h)),
             callback_data=f"ytqual:{session_id}:{h}"
         ))
         if len(pair) == 2:
@@ -2571,7 +2711,7 @@ def build_youtube_quality_keyboard(session_id: str, qualities: dict[int, float |
         rows.append(pair)
 
     best_h = max(sorted_heights)
-    best_sz = qualities[best_h]
+    best_sz = _size_of(best_h)
     best_text = f"⚡ Скачать лучшее (~{best_sz} МБ)" if best_sz is not None else "⚡ Скачать лучшее"
     rows.append([InlineKeyboardButton(
         text=best_text,
@@ -2614,6 +2754,8 @@ async def handle_youtube_session_timeout(session_id: str, delay: int = 60):
 
     qualities = session.get("qualities", {})
     best_height = max(qualities.keys()) if qualities else None
+    q_entry = qualities.get(best_height) if best_height else None
+    video_format_id = q_entry.get("format_id") if isinstance(q_entry, dict) else None
 
     status_msg = session["status_msg"]
     title = session.get("title", "Видео")
@@ -2644,7 +2786,8 @@ async def handle_youtube_session_timeout(session_id: str, delay: int = 60):
         audio_format_id=chosen_track.get("format_id") if chosen_track else None,
         track_name=audio_label,
         duration=session.get("duration"),
-        max_height=best_height if session.get("mode") != "audio" else None
+        max_height=best_height if session.get("mode") != "audio" else None,
+        video_format_id=video_format_id if session.get("mode") != "audio" else None
     )
 
 @dp.callback_query(F.data.startswith("ytaudio:"))
@@ -2674,6 +2817,8 @@ async def youtube_audio_callback(callback: CallbackQuery):
         label = chosen_track.get("label", "Оригинал") if chosen_track else "Оригинал"
         qualities = session.get("qualities", {})
         best_height = max(qualities.keys()) if qualities else None
+        q_entry = qualities.get(best_height) if best_height else None
+        video_format_id = q_entry.get("format_id") if isinstance(q_entry, dict) else None
 
         await callback.answer("Скачиваю оригинал в лучшем качестве...")
         status_msg = session["status_msg"]
@@ -2697,7 +2842,8 @@ async def youtube_audio_callback(callback: CallbackQuery):
             audio_format_id=chosen_track.get("format_id") if chosen_track else None,
             track_name=label,
             duration=session.get("duration"),
-            max_height=best_height
+            max_height=best_height,
+            video_format_id=video_format_id
         )
         return
 
@@ -2804,6 +2950,9 @@ async def youtube_quality_callback(callback: CallbackQuery):
         except ValueError:
             chosen_height = max(qualities.keys()) if qualities else None
 
+    q_entry = qualities.get(chosen_height) if chosen_height else None
+    video_format_id = q_entry.get("format_id") if isinstance(q_entry, dict) else None
+
     label_q = f"{chosen_height}p" if chosen_height else "Лучшее"
     await callback.answer(f"Выбрано качество: {label_q}")
 
@@ -2838,7 +2987,8 @@ async def youtube_quality_callback(callback: CallbackQuery):
         audio_format_id=audio_format_id,
         track_name=audio_label,
         duration=session.get("duration"),
-        max_height=chosen_height
+        max_height=chosen_height,
+        video_format_id=video_format_id
     )
 
 # --- ОЧЕРЕДЬ И ВАЛИДАЦИЯ ---
@@ -2851,7 +3001,8 @@ async def enqueue_job(
     audio_format_id: str | None = None,
     track_name: str | None = None,
     duration: float | None = None,
-    max_height: int | None = None
+    max_height: int | None = None,
+    video_format_id: str | None = None
 ):
     user_id = message.from_user.id
     current_queue_len = len(QUEUE_JOBS)
@@ -2899,7 +3050,8 @@ async def enqueue_job(
             track_name=track_name,
             duration=duration,
             timeout=calculate_job_timeout(duration),
-            max_height=max_height
+            max_height=max_height,
+            video_format_id=video_format_id
         )
         QUEUE_JOBS.append(job)
         await DOWNLOAD_QUEUE.put(job)
@@ -3102,7 +3254,9 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
 
         # Вариант 3: Одно качество или без выбора — сразу скачиваем
         best_h = max(qualities.keys()) if qualities else None
-        await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration, max_height=best_h)
+        q_entry = qualities.get(best_h) if best_h else None
+        v_fid = q_entry.get("format_id") if isinstance(q_entry, dict) else None
+        await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration, max_height=best_h, video_format_id=v_fid)
         return
 
     # Для всех остальных сервисов (TikTok, Reels, VK, Reddit и др.) — стандартная отправка в очередь
@@ -3642,7 +3796,11 @@ async def download_for_inline(url: str) -> dict | None:
         elif videos:
             video_items = []
             for idx, raw_vid in enumerate(videos[:10]):
-                vid = await ensure_h264(raw_vid)
+                raw_size = os.path.getsize(raw_vid) if os.path.exists(raw_vid) else 0
+                if raw_size > 49 * 1024 * 1024:
+                    vid = await remux_to_mp4(raw_vid, timeout=60.0)
+                else:
+                    vid = await ensure_h264(raw_vid)
                 item_token = f"{token}_{idx:02d}"
                 raw_base = os.path.splitext(os.path.basename(vid))[0]
                 # Очистка названия от системных спецсимволов для безопасного сохранения
