@@ -1,0 +1,13 @@
+# Пример конфигурации Caddy для работы через Docker Compose
+# Замените your-domain.com на ваш реальный домен
+your-domain.com {
+    handle /health* {
+        reverse_proxy mega-bot:8080
+    }
+    handle /dl/* {
+        reverse_proxy mega-bot:8080
+    }
+    handle {
+        reverse_proxy mega-bot:8080
+    }
+}

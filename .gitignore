@@ -63,3 +63,5 @@ Thumbs.db
 # Caddy & Docker data
 caddy_data/
 caddy_config/
+Caddyfile
+!Caddyfile.example

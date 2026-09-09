@@ -3,12 +3,36 @@ services:
     build: .
     container_name: mega-bot
     restart: unless-stopped
+    init: true
     env_file:
       - .env
+    expose:
+      - "8080"
     ports:
-      - "${WEB_PORT:-8080}:8080"
+      - "${HOST_PORT_BIND:-8080}:8080"
     volumes:
       - ./data:/app/data
+      - ./bot.py:/app/bot.py
     environment:
       - PYTHONUNBUFFERED=1
-      - DATA_DIR=/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:alpine
+    container_name: mega-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./caddy_data:/data
+      - ./caddy_config:/config
+    depends_on:
+      - mega-bot
+    profiles:
+      - caddy
