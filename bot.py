@@ -453,7 +453,6 @@ async def handle_thumb(request: web.Request) -> web.StreamResponse:
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_root)
-    app.router.add_head("/", handle_root)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/dl/thumb/{token}.jpg", handle_thumb)
     app.router.add_get("/dl/{token}/{filename}", handle_download)
