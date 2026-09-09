@@ -83,6 +83,9 @@ ACTIVE_CONVERSIONS: set[int] = set()  # Защита от DoS спама кно�
 # Реестры файлов
 DOWNLOAD_LINKS: dict[str, dict] = {}
 CONVERT_CACHE: dict[str, dict] = {}
+INLINE_ACTIVE_TASKS: dict[str, asyncio.Task] = {}
+INLINE_RESULTS_CACHE: dict[str, tuple[float, dict]] = {}
+INLINE_FAILED_URLS: dict[str, tuple[float, str]] = {}
 
 @dataclass
 class DownloadJob:
@@ -312,30 +315,60 @@ async def init_db():
         """)
         await db.commit()
 
-async def save_media_cache(url: str, file_id: str, media_type: str, title: str):
+def extract_media_cache_keys(url: str) -> list[str]:
+    """Генерирует список ключей для поиска в кэше: сырой url, чистый без параметров, и ID для YouTube."""
+    if not url:
+        return []
+    keys = [url]
     clean = url.split("?")[0].rstrip("/")
+    if clean != url:
+        keys.append(clean)
+    yt_match = re.search(r'(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+    if yt_match:
+        yt_id = yt_match.group(1)
+        keys.append(f"yt:{yt_id}")
+        keys.append(f"https://youtu.be/{yt_id}")
+        keys.append(f"https://www.youtube.com/watch?v={yt_id}")
+    return list(dict.fromkeys(keys))
+
+def find_in_download_links(url: str) -> tuple[str, dict] | None:
+    """Ищет активную прямую раздачу файла на веб-сервере по URL медиа."""
     now = time.time()
+    keys = extract_media_cache_keys(url)
+    for token, item in list(DOWNLOAD_LINKS.items()):
+        if now > item.get("expire_at", 0):
+            continue
+        if not os.path.exists(item.get("path", "")):
+            continue
+        item_keys = item.get("keys") or extract_media_cache_keys(item.get("url", ""))
+        if any(k in item_keys for k in keys):
+            return token, item
+    return None
+
+async def save_media_cache(url: str, file_id: str, media_type: str, title: str):
+    now = time.time()
+    keys = extract_media_cache_keys(url)
     try:
         async with get_db() as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO media_cache (url, file_id, media_type, title, created_at) VALUES (?, ?, ?, ?, ?);",
-                (url, file_id, media_type, title, now)
-            )
-            await db.execute(
-                "INSERT OR REPLACE INTO media_cache (url, file_id, media_type, title, created_at) VALUES (?, ?, ?, ?, ?);",
-                (clean, file_id, media_type, title, now)
-            )
+            for k in keys:
+                await db.execute(
+                    "INSERT OR REPLACE INTO media_cache (url, file_id, media_type, title, created_at) VALUES (?, ?, ?, ?, ?);",
+                    (k, file_id, media_type, title, now)
+                )
             await db.commit()
     except Exception as e:
         logging.warning(f"Failed to save media_cache: {e}")
 
 async def get_media_cache(url: str):
-    clean = url.split("?")[0].rstrip("/")
+    keys = extract_media_cache_keys(url)
+    if not keys:
+        return None
+    placeholders = ",".join("?" for _ in keys)
     try:
         async with get_db() as db:
             async with db.execute(
-                "SELECT file_id, media_type, title FROM media_cache WHERE url = ? OR url = ? LIMIT 1;",
-                (url, clean)
+                f"SELECT file_id, media_type, title FROM media_cache WHERE url IN ({placeholders}) LIMIT 1;",
+                tuple(keys)
             ) as cursor:
                 return await cursor.fetchone()
     except Exception:
@@ -442,8 +475,11 @@ p{color:#94a3b8;line-height:1.6;}
 
 async def handle_thumb(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token")
+    disk_thumb = f"{WEB_DOWNLOADS_DIR}/{token}_thumb.jpg"
+    if os.path.exists(disk_thumb):
+        return web.FileResponse(disk_thumb, headers={"Content-Type": "image/jpeg"})
     info = DOWNLOAD_LINKS.get(token)
-    if info and "thumb_path" in info and os.path.exists(info["thumb_path"]):
+    if info and "thumb_path" in info and info["thumb_path"] and os.path.exists(info["thumb_path"]):
         return web.FileResponse(info["thumb_path"], headers={"Content-Type": "image/jpeg"})
     default_thumb = os.path.join(DATA_DIR, "default_thumb.jpg")
     if os.path.exists(default_thumb):
@@ -471,9 +507,20 @@ async def cleanup_worker():
             now = time.time()
 
             # 1. Проверка свободного места
-            _, _, free_bytes = shutil.disk_usage("/")
+            disk_target = DATA_DIR if os.path.exists(DATA_DIR) else "/"
+            _, _, free_bytes = shutil.disk_usage(disk_target)
             if free_bytes < MIN_FREE_DISK_BYTES:
                 emergency_disk_cleanup()
+
+            # 1.1 Очистка кэша результатов инлайна
+            for u, item_tuple in list(INLINE_RESULTS_CACHE.items()):
+                ts = item_tuple[0] if isinstance(item_tuple, (tuple, list)) else 0
+                if now - ts > WEB_TTL_SECONDS:
+                    INLINE_RESULTS_CACHE.pop(u, None)
+            for u, fail_item in list(INLINE_FAILED_URLS.items()):
+                ts = fail_item[0] if isinstance(fail_item, (tuple, list)) else (fail_item if isinstance(fail_item, (int, float)) else 0)
+                if now - ts > 180:
+                    INLINE_FAILED_URLS.pop(u, None)
 
             # 2. Удаление просроченных веб-ссылок (>7 минут)
             expired_tokens = [tok for tok, item in list(DOWNLOAD_LINKS.items()) if now > item["expire_at"]]
@@ -1574,13 +1621,38 @@ async def process_download_job(job: DownloadJob):
                     dest_file = f"{WEB_DOWNLOADS_DIR}/{token}_{base_name}"
                     shutil.copy2(vid, dest_file)
 
+                    thumb_path = f"{WEB_DOWNLOADS_DIR}/{token}_thumb.jpg"
+                    try:
+                        t_proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-ss", "00:00:01", "-i", dest_file, "-vframes", "1", "-q:v", "2", thumb_path,
+                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                            preexec_fn=os.setsid
+                        )
+                        await asyncio.wait_for(t_proc.wait(), timeout=5.0)
+                    except Exception:
+                        pass
+
+                    cache_keys = extract_media_cache_keys(job.url)
                     DOWNLOAD_LINKS[token] = {
                         "path": dest_file,
+                        "thumb_path": thumb_path if os.path.exists(thumb_path) else None,
                         "filename": base_name,
                         "expire_at": time.time() + WEB_TTL_SECONDS,
                         "size_mb": file_size_mb,
-                        "user_id": job.user_id
+                        "user_id": job.user_id,
+                        "url": job.url,
+                        "keys": cache_keys,
+                        "is_large": True
                     }
+
+                    # Сохраняем в media_cache для мгновенной отдачи в инлайне
+                    cache_payload = json.dumps({
+                        "token": token,
+                        "filename": base_name,
+                        "size_mb": file_size_mb,
+                        "has_thumb": os.path.exists(thumb_path)
+                    })
+                    await save_media_cache(job.url, cache_payload, "web_video", base_name)
 
                     cache_id = uuid.uuid4().hex[:12]
                     CONVERT_CACHE[cache_id] = {
@@ -2398,8 +2470,6 @@ def extract_clean_url(text: str) -> str | None:
     return url
 
 
-INLINE_ACTIVE_TASKS: dict[str, asyncio.Task] = {}
-
 async def download_for_inline(url: str) -> dict | None:
     """Быстрая фоновая загрузка медиа для inline-отправки (макс 720p, лимит 48 МБ)."""
     task_dir = f"/tmp/{uuid.uuid4().hex}"
@@ -2423,7 +2493,18 @@ async def download_for_inline(url: str) -> dict | None:
         # 6. yt-dlp (быстрый пресет 720p/480p)
         if not downloaded:
             output_template = f"{task_dir}/%(autonumber)02d_%(id)s.%(ext)s"
-            format_rule = "bestvideo[height<=720][filesize<45M]+bestaudio/best[height<=720][filesize<45M]/best[filesize<45M]/best"
+            format_rule = (
+                "bestvideo[height<=720][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
+                "best[height<=720][filesize<44M]/"
+                "bestvideo[height<=480][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
+                "best[height<=480][filesize<44M]/"
+                "bestvideo[height<=360][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
+                "best[height<=360][filesize<44M]/"
+                f"bestvideo[height<=720][filesize_approx<{MAX_FILE_SIZE_MB}M]+bestaudio/"
+                f"best[height<=720][filesize<{MAX_FILE_SIZE_MB}M]/"
+                f"best[filesize<{MAX_FILE_SIZE_MB}M]/"
+                "best"
+            )
             is_youtube = "youtube.com" in url or "youtu.be" in url
             playlist_args = ["--no-playlist"] if is_youtube else ["--yes-playlist", "--playlist-end", "20"]
             cmd = [
@@ -2431,11 +2512,11 @@ async def download_for_inline(url: str) -> dict | None:
                 *playlist_args,
                 "--format", format_rule,
                 "--output", output_template,
-                "--max-filesize", "48M",
+                "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                 "--no-write-thumbnail",
                 "--no-write-description",
                 "--no-write-info-json",
-                "--socket-timeout", "10",
+                "--socket-timeout", "15",
                 "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}",
                 url
             ]
@@ -2449,7 +2530,7 @@ async def download_for_inline(url: str) -> dict | None:
                 preexec_fn=os.setsid
             )
             try:
-                await asyncio.wait_for(proc.wait(), timeout=30.0)
+                await asyncio.wait_for(proc.wait(), timeout=60.0)
             except asyncio.TimeoutError:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -2495,12 +2576,15 @@ async def download_for_inline(url: str) -> dict | None:
 
                 if os.path.exists(dest_file):
                     fsize = os.path.getsize(dest_file)
+                    keys = extract_media_cache_keys(url)
                     DOWNLOAD_LINKS[item_token] = {
                         "path": dest_file,
                         "filename": f"photo_{idx+1}.jpg",
                         "expire_at": now + WEB_TTL_SECONDS,
                         "size_mb": round(fsize / (1024 * 1024), 1),
-                        "user_id": 0
+                        "user_id": 0,
+                        "url": url,
+                        "keys": keys
                     }
                     photo_items.append({
                         "token": item_token,
@@ -2515,12 +2599,15 @@ async def download_for_inline(url: str) -> dict | None:
                 aud_token = f"{token}_aud"
                 dest_aud = f"{WEB_DOWNLOADS_DIR}/{aud_token}.mp3"
                 shutil.copy2(a, dest_aud)
+                keys = extract_media_cache_keys(url)
                 DOWNLOAD_LINKS[aud_token] = {
                     "path": dest_aud,
                     "filename": "audio.mp3",
                     "expire_at": now + WEB_TTL_SECONDS,
                     "size_mb": round(os.path.getsize(dest_aud) / (1024 * 1024), 1),
-                    "user_id": 0
+                    "user_id": 0,
+                    "url": url,
+                    "keys": keys
                 }
                 audio_item = {
                     "token": aud_token,
@@ -2571,20 +2658,39 @@ async def download_for_inline(url: str) -> dict | None:
                     pass
 
                 fsize = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
+                fsize_mb = round(fsize / (1024 * 1024), 1)
+                is_large = fsize > MAX_TG_FILE_SIZE_BYTES
+                keys = extract_media_cache_keys(url)
+
                 DOWNLOAD_LINKS[item_token] = {
                     "path": dest_file,
-                    "thumb_path": thumb_path,
+                    "thumb_path": thumb_path if os.path.exists(thumb_path) else None,
                     "filename": f"video_{idx+1}.mp4",
                     "expire_at": now + WEB_TTL_SECONDS,
-                    "size_mb": round(fsize / (1024 * 1024), 1),
-                    "user_id": 0
+                    "size_mb": fsize_mb,
+                    "user_id": 0,
+                    "url": url,
+                    "keys": keys,
+                    "is_large": is_large
                 }
+
+                if is_large:
+                    payload = json.dumps({
+                        "token": item_token,
+                        "filename": f"video_{idx+1}.mp4",
+                        "size_mb": fsize_mb,
+                        "has_thumb": os.path.exists(thumb_path)
+                    })
+                    await save_media_cache(url, payload, "web_video", os.path.basename(vid))
+
                 video_items.append({
                     "token": item_token,
                     "filename": f"video_{idx+1}.mp4",
                     "index": idx + 1,
                     "total": len(videos[:10]),
-                    "title": os.path.basename(vid)
+                    "title": os.path.basename(vid),
+                    "size_mb": fsize_mb,
+                    "is_large": is_large
                 })
 
             # Смешанная карусель: видео + фото
@@ -2611,12 +2717,15 @@ async def download_for_inline(url: str) -> dict | None:
 
                     if os.path.exists(dest_file):
                         fsize = os.path.getsize(dest_file)
+                        keys = extract_media_cache_keys(url)
                         DOWNLOAD_LINKS[item_token] = {
                             "path": dest_file,
                             "filename": f"photo_{idx+1}.jpg",
                             "expire_at": now + WEB_TTL_SECONDS,
                             "size_mb": round(fsize / (1024 * 1024), 1),
-                            "user_id": 0
+                            "user_id": 0,
+                            "url": url,
+                            "keys": keys
                         }
                         extra_photos.append({
                             "token": item_token,
@@ -2637,24 +2746,69 @@ async def download_for_inline(url: str) -> dict | None:
             a = audios[0]
             dest_file = f"{WEB_DOWNLOADS_DIR}/{token}_audio.mp3"
             shutil.copy2(a, dest_file)
+            keys = extract_media_cache_keys(url)
             DOWNLOAD_LINKS[token] = {
                 "path": dest_file,
                 "filename": "audio.mp3",
                 "expire_at": now + WEB_TTL_SECONDS,
                 "size_mb": round(os.path.getsize(dest_file) / (1024 * 1024), 1),
-                "user_id": 0
+                "user_id": 0,
+                "url": url,
+                "keys": keys
             }
             return {
                 "type": "audio",
                 "token": token,
                 "filename": "audio.mp3",
-                "title": "Аудио"
+                "title": "Аудио",
+                "size_mb": round(os.path.getsize(dest_file) / (1024 * 1024), 1)
             }
     except Exception as e:
         logging.error(f"download_for_inline error for {url}: {e}")
     finally:
         shutil.rmtree(task_dir, ignore_errors=True)
     return None
+
+
+def make_web_download_article(token: str, filename: str, size_mb: float, title: str | None = None, bot_sign: str = "бота") -> InlineQueryResultArticle:
+    """Создает карточку для скачивания больших файлов (> 50 МБ) через инлайн-режим."""
+    dl_url = f"{WEB_BASE_URL}/dl/{token}/{filename}"
+    th_url = f"{WEB_BASE_URL}/dl/thumb/{token}.jpg"
+    thumb_path = f"{WEB_DOWNLOADS_DIR}/{token}_thumb.jpg"
+    thumb_to_use = th_url if os.path.exists(thumb_path) else None
+
+    clean_title = (title or filename).strip()
+    if len(clean_title) > 60:
+        clean_title = clean_title[:57] + "..."
+
+    display_size = f"{size_mb:.1f}" if isinstance(size_mb, (int, float)) else str(size_mb)
+
+    card_text = (
+        f"🎬 <b>{html.escape(clean_title)}</b>\n"
+        f"📦 Размер: <b>{display_size} МБ</b>\n\n"
+        f"⚠️ <i>Файл превышает 50 МБ (лимит Telegram для инлайн-видео).</i>\n"
+        f"⬇️ <b>Прямая ссылка для скачивания:</b>\n"
+        f"🔗 <a href=\"{dl_url}\">{html.escape(filename)}</a>\n\n"
+        f"<i>Скачано через {bot_sign}</i>"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text=f"⬇️ Скачать видео ({display_size} МБ)", url=dl_url)]
+    ]
+    if BOT_USERNAME:
+        buttons.append([InlineKeyboardButton(text="🤖 Открыть бота", url=f"https://t.me/{BOT_USERNAME}")])
+
+    return InlineQueryResultArticle(
+        id=f"wl_{token}",
+        title=f"🎬 Скачать видео ({display_size} МБ)",
+        description=f"{clean_title} • Доступно по прямой ссылке",
+        thumbnail_url=thumb_to_use,
+        input_message_content=InputTextMessageContent(
+            message_text=card_text,
+            parse_mode="HTML"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 @dp.inline_query()
@@ -2719,6 +2873,22 @@ async def inline_query_handler(query: InlineQuery):
                         caption=f"🎬 Скачано через {bot_sign}"
                     )
                 )
+            elif media_type == "web_video":
+                try:
+                    data = json.loads(file_id)
+                    t = data.get("token")
+                    fn = data.get("filename", "video.mp4")
+                    size_mb = data.get("size_mb", 0)
+                    file_path = f"{WEB_DOWNLOADS_DIR}/{t}.mp4"
+                    dl_entry = DOWNLOAD_LINKS.get(t)
+                    if dl_entry:
+                        file_path = dl_entry.get("path", file_path)
+                        fn = dl_entry.get("filename", fn)
+                        size_mb = dl_entry.get("size_mb", size_mb)
+                    if t and os.path.exists(file_path):
+                        results.append(make_web_download_article(t, fn, size_mb, title, bot_sign))
+                except Exception as e:
+                    logging.warning(f"Error parsing cached web_video: {e}")
             elif media_type == "photo":
                 results.append(
                     InlineQueryResultCachedPhoto(
@@ -2758,17 +2928,121 @@ async def inline_query_handler(query: InlineQuery):
                 await query.answer(results=results, cache_time=300, is_personal=False)
                 return
 
-        # 2. Если в кэше нет — запускаем быструю подготовку файла
-        task = INLINE_ACTIVE_TASKS.get(url)
-        if not task or task.done():
-            task = asyncio.create_task(download_for_inline(url))
-            INLINE_ACTIVE_TASKS[url] = task
+        # 2. Проверяем активную раздачу в оперативной памяти / на диске (если медиа уже скачано)
+        active_dl = find_in_download_links(url)
+        if active_dl:
+            t, item = active_dl
+            fsize_mb = item.get("size_mb") or (round(os.path.getsize(item["path"]) / (1024 * 1024), 1) if os.path.exists(item.get("path", "")) else 0)
+            is_large = item.get("is_large", False) or fsize_mb > 49.0
+            fn = item.get("filename", "video.mp4")
+            v_title = item.get("title") or fn
 
+            if is_large:
+                await query.answer(
+                    results=[make_web_download_article(t, fn, fsize_mb, v_title, bot_sign)],
+                    cache_time=120,
+                    is_personal=False
+                )
+                return
+            else:
+                v_url = f"{WEB_BASE_URL}/dl/{t}/{fn}"
+                th_url = f"{WEB_BASE_URL}/dl/thumb/{t}.jpg"
+                thumb_path = f"{WEB_DOWNLOADS_DIR}/{t}_thumb.jpg"
+                thumb_to_use = th_url if os.path.exists(thumb_path) else None
+                await query.answer(
+                    results=[
+                        InlineQueryResultVideo(
+                            id=f"v_{t}",
+                            video_url=v_url,
+                            mime_type="video/mp4",
+                            thumbnail_url=thumb_to_use or v_url,
+                            title="🎬 Отправить видео",
+                            description=f"{v_title} ({fsize_mb} МБ)",
+                            caption=f"🎬 {v_title}\n\nСкачано через {bot_sign}"
+                        )
+                    ],
+                    cache_time=120,
+                    is_personal=False
+                )
+                return
+
+        now = time.time()
+
+        # 3. Проверяем кэш готовых результатов инлайна в памяти
         res = None
-        try:
-            res = await asyncio.wait_for(asyncio.shield(task), timeout=4.5)
-        except asyncio.TimeoutError:
-            res = None
+        if url in INLINE_RESULTS_CACHE:
+            ts, res_cached = INLINE_RESULTS_CACHE[url]
+            if now - ts < WEB_TTL_SECONDS:
+                res = res_cached
+
+        # 4. Проверяем недавние ошибки (защита от зацикливания при битых ссылках)
+        if not res and url in INLINE_FAILED_URLS:
+            fail_ts, err_reason = INLINE_FAILED_URLS[url]
+            if now - fail_ts < 30:
+                err_text = (
+                    f"❌ <b>Не удалось подготовить медиа для инлайн-режима</b>\n\n"
+                    f"💡 <i>Отправьте ссылку напрямую в диалог с ботом {bot_sign}, чтобы скачать файл без ограничений.</i>"
+                )
+                buttons = []
+                if BOT_USERNAME:
+                    buttons.append([InlineKeyboardButton(text="🤖 Открыть бота", url=f"https://t.me/{BOT_USERNAME}")])
+                await query.answer(
+                    results=[
+                        InlineQueryResultArticle(
+                            id=f"err_{uuid.uuid4().hex[:8]}",
+                            title="❌ Ошибка подготовки медиа",
+                            description="Попробуй отправить ссылку напрямую боту",
+                            input_message_content=InputTextMessageContent(
+                                message_text=err_text,
+                                parse_mode="HTML"
+                            ),
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+                        )
+                    ],
+                    cache_time=5,
+                    is_personal=True
+                )
+                return
+
+        # 5. Если результат ещё не готов — работаем с фоновым заданием
+        if not res:
+            task = INLINE_ACTIVE_TASKS.get(url)
+            if task:
+                if task.done():
+                    try:
+                        res = task.result()
+                    except Exception as e:
+                        logging.warning(f"Inline task raised error: {e}")
+                        res = None
+                    INLINE_ACTIVE_TASKS.pop(url, None)
+                    if res:
+                        INLINE_RESULTS_CACHE[url] = (time.time(), res)
+                    else:
+                        INLINE_FAILED_URLS[url] = (time.time(), "Empty result")
+                else:
+                    try:
+                        res = await asyncio.wait_for(asyncio.shield(task), timeout=4.5)
+                        if task.done():
+                            INLINE_ACTIVE_TASKS.pop(url, None)
+                            if res:
+                                INLINE_RESULTS_CACHE[url] = (time.time(), res)
+                            else:
+                                INLINE_FAILED_URLS[url] = (time.time(), "Empty result")
+                    except asyncio.TimeoutError:
+                        res = None
+            else:
+                task = asyncio.create_task(download_for_inline(url))
+                INLINE_ACTIVE_TASKS[url] = task
+                try:
+                    res = await asyncio.wait_for(asyncio.shield(task), timeout=4.5)
+                    if task.done():
+                        INLINE_ACTIVE_TASKS.pop(url, None)
+                        if res:
+                            INLINE_RESULTS_CACHE[url] = (time.time(), res)
+                        else:
+                            INLINE_FAILED_URLS[url] = (time.time(), "Empty result")
+                except asyncio.TimeoutError:
+                    res = None
 
         if res:
             mtype = res.get("type", "video")
@@ -2777,35 +3051,53 @@ async def inline_query_handler(query: InlineQuery):
             if mtype in ("video", "videos"):
                 items = res.get("items", [])
                 if not items and "token" in res:
-                    items = [{"token": res["token"], "filename": res["filename"], "index": 1, "total": 1}]
+                    items = [{
+                        "token": res["token"],
+                        "filename": res["filename"],
+                        "index": 1,
+                        "total": 1,
+                        "is_large": res.get("is_large", False),
+                        "size_mb": res.get("size_mb", 0),
+                        "title": res.get("title")
+                    }]
 
                 total = len(items)
                 for it in items:
                     t = it["token"]
                     fn = it["filename"]
                     idx = it.get("index", 1)
-                    v_url = f"{WEB_BASE_URL}/dl/{t}/{fn}"
-                    th_url = f"{WEB_BASE_URL}/dl/thumb/{t}.jpg"
-                    if total > 1:
-                        v_title = f"🎬 Видео {idx}/{total}"
-                        v_desc = f"Нажми для отправки видео {idx} из {total}"
-                        v_caption = f"🎬 Видео {idx}/{total} • Скачано через {bot_sign}"
-                    else:
-                        v_title = "🎬 Отправить видео"
-                        v_desc = "Нажми для отправки видео в чат"
-                        v_caption = f"🎬 Скачано через {bot_sign}"
+                    size_mb = it.get("size_mb", 0)
+                    is_large = it.get("is_large", False) or size_mb > 49.0
+                    v_title = it.get("title") or (f"Видео {idx}/{total}" if total > 1 else "Видео")
 
-                    results.append(
-                        InlineQueryResultVideo(
-                            id=f"v_{t}",
-                            video_url=v_url,
-                            mime_type="video/mp4",
-                            thumbnail_url=th_url,
-                            title=v_title,
-                            description=v_desc,
-                            caption=v_caption
+                    if is_large:
+                        results.append(make_web_download_article(t, fn, size_mb, v_title, bot_sign))
+                    else:
+                        v_url = f"{WEB_BASE_URL}/dl/{t}/{fn}"
+                        th_url = f"{WEB_BASE_URL}/dl/thumb/{t}.jpg"
+                        thumb_path = f"{WEB_DOWNLOADS_DIR}/{t}_thumb.jpg"
+                        thumb_to_use = th_url if os.path.exists(thumb_path) else None
+
+                        if total > 1:
+                            v_card_title = f"🎬 Видео {idx}/{total}"
+                            v_desc = f"Нажми для отправки видео {idx} из {total}"
+                            v_caption = f"🎬 Видео {idx}/{total} • Скачано через {bot_sign}"
+                        else:
+                            v_card_title = "🎬 Отправить видео"
+                            v_desc = "Нажми для отправки видео в чат"
+                            v_caption = f"🎬 Скачано через {bot_sign}"
+
+                        results.append(
+                            InlineQueryResultVideo(
+                                id=f"v_{t}",
+                                video_url=v_url,
+                                mime_type="video/mp4",
+                                thumbnail_url=thumb_to_use or v_url,
+                                title=v_card_title,
+                                description=v_desc,
+                                caption=v_caption
+                            )
                         )
-                    )
 
                 extra_photos = res.get("photos", [])
                 p_total = len(extra_photos)
@@ -2873,15 +3165,32 @@ async def inline_query_handler(query: InlineQuery):
             elif mtype == "audio":
                 token = res["token"]
                 filename = res["filename"]
+                size_mb = res.get("size_mb", 0)
                 audio_url = f"{WEB_BASE_URL}/dl/{token}/{filename}"
-                results.append(
-                    InlineQueryResultAudio(
-                        id=f"a_{token}",
-                        audio_url=audio_url,
-                        title=res.get("title", "🎵 Отправить аудио"),
-                        caption=f"🎵 Скачано через {bot_sign}"
+                if size_mb > 49.0:
+                    results.append(
+                        InlineQueryResultArticle(
+                            id=f"a_dl_{token}",
+                            title=f"🎵 Скачать аудио ({size_mb} МБ)",
+                            description="Файл превышает лимит Telegram для инлайн-аудио",
+                            input_message_content=InputTextMessageContent(
+                                message_text=f"🎵 <b>{html.escape(filename)}</b>\n📦 Размер: <b>{size_mb} МБ</b>\n\n🔗 <a href=\"{audio_url}\">Скачать аудио</a>\n\n<i>Скачано через {bot_sign}</i>",
+                                parse_mode="HTML"
+                            ),
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text=f"⬇️ Скачать аудио ({size_mb} МБ)", url=audio_url)]
+                            ])
+                        )
                     )
-                )
+                else:
+                    results.append(
+                        InlineQueryResultAudio(
+                            id=f"a_{token}",
+                            audio_url=audio_url,
+                            title=res.get("title", "🎵 Отправить аудио"),
+                            caption=f"🎵 Скачано через {bot_sign}"
+                        )
+                    )
 
             if results:
                 await query.answer(
@@ -2891,7 +3200,34 @@ async def inline_query_handler(query: InlineQuery):
                 )
                 return
 
-        # 3. Если скачивание ещё идет — кнопка авто-обновления запроса
+        # 6. Если задача завершилась с ошибкой — показываем карточку ошибки
+        if url in INLINE_FAILED_URLS:
+            err_text = (
+                f"❌ <b>Не удалось подготовить медиа для инлайн-режима</b>\n\n"
+                f"💡 <i>Отправьте ссылку напрямую боту {bot_sign}, чтобы скачать файл без ограничений.</i>"
+            )
+            buttons = []
+            if BOT_USERNAME:
+                buttons.append([InlineKeyboardButton(text="🤖 Открыть бота", url=f"https://t.me/{BOT_USERNAME}")])
+            await query.answer(
+                results=[
+                    InlineQueryResultArticle(
+                        id=f"err_{uuid.uuid4().hex[:8]}",
+                        title="❌ Ошибка подготовки медиа",
+                        description="Попробуй отправить ссылку напрямую боту",
+                        input_message_content=InputTextMessageContent(
+                            message_text=err_text,
+                            parse_mode="HTML"
+                        ),
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+                    )
+                ],
+                cache_time=5,
+                is_personal=True
+            )
+            return
+
+        # 7. Если скачивание ещё идет в фоне — кнопка авто-обновления запроса
         await query.answer(
             results=[
                 InlineQueryResultArticle(
