@@ -190,10 +190,11 @@ mkdir -p "${INSTALL_DIR}/data/cache"
 chmod 755 "${INSTALL_DIR}/data"
 
 # Генерация .env
-echo -e "\n${BLUE}📝 Создание файла конфигурации .env...${NC}"
 COMPOSE_PROFILES=""
+HOST_PORT_BIND="8080"
 if [ "$USE_CADDY" = true ]; then
     COMPOSE_PROFILES="caddy"
+    HOST_PORT_BIND="127.0.0.1:8080"
 fi
 
 cat << ENV_CONFIG > "${INSTALL_DIR}/.env"
@@ -207,7 +208,7 @@ DATA_DIR=${INSTALL_DIR}/data
 
 # Docker Compose профили
 COMPOSE_PROFILES=${COMPOSE_PROFILES}
-HOST_PORT_BIND=8080
+HOST_PORT_BIND=${HOST_PORT_BIND}
 
 # Параметры оптимизации сервера (${SELECTED_PROFILE})
 NUM_WORKERS=${NUM_WORKERS}
@@ -270,6 +271,11 @@ CADDY_DOCKER
             ufw allow 80/tcp >/dev/null 2>&1 || true
             ufw allow 443/tcp >/dev/null 2>&1 || true
         fi
+    else
+        # Создаем заглушку файла Caddyfile, чтобы Docker не создавал папку при монтировании
+        if [ ! -f "${INSTALL_DIR}/Caddyfile" ]; then
+            cp "${INSTALL_DIR}/Caddyfile.example" "${INSTALL_DIR}/Caddyfile" 2>/dev/null || touch "${INSTALL_DIR}/Caddyfile"
+        fi
     fi
 
     # Сборка и запуск контейнеров
@@ -283,9 +289,15 @@ CADDY_DOCKER
     echo -e "\n${CYAN}🔍 Проверка статуса контейнеров...${NC}"
     docker compose ps
 
-    echo -e "\n${GREEN}====================================================================${NC}"
-    echo -e "${GREEN}${BOLD}🎉 БОТ УСПЕШНО РАЗВЕРНУТ В DOCKER!${NC}"
-    echo -e "===================================================================="
+    if docker compose ps --status running 2>/dev/null | grep -q "mega-bot"; then
+        echo -e "\n${GREEN}====================================================================${NC}"
+        echo -e "${GREEN}${BOLD}🎉 БОТ УСПЕШНО РАЗВЕРНУТ И ЗАПУЩЕН В DOCKER!${NC}"
+        echo -e "===================================================================="
+    else
+        echo -e "\n${RED}⚠️ Ошибка: Контейнер mega-bot не смог запуститься. Логи:${NC}"
+        docker compose logs --tail 30
+        exit 1
+    fi
     echo -e "${GREEN}${BOLD}📋 КОМАНДЫ УПРАВЛЕНИЯ DOCKER-СТЕКОМ:${NC}"
     echo -e "  • Статус контейнеров:    ${BOLD}docker compose ps${NC}"
     echo -e "  • Живые логи бота:       ${BOLD}docker compose logs -f mega-bot${NC}"

@@ -599,17 +599,72 @@ def parse_ytdlp_error(stderr_text: str) -> str:
     if "join this channel" in lower or "members-only" in lower:
         return "Видео доступно только спонсорам канала."
     if "max-filesize" in lower:
-        return "Файл превышает лимит сервера (200 МБ)."
-    return "Не удалось скачать. Видео приватное, превышен лимит 200 МБ или сервис временно недоступен."
+        return f"Файл превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ)."
+    return f"Не удалось скачать. Видео приватное, превышен лимит {MAX_FILE_SIZE_MB} МБ или сервис временно недоступен."
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРОГРЕСС-БАРА И МЕДИА ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРОГРЕСС-БАРА И ВРЕМЕНИ СКАЧИВАНИЯ ---
+
+def strip_ansi(text: str) -> str:
+    """Очищает строку от ANSI escape-последовательностей (цвета терминала)."""
+    if not text:
+        return ""
+    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+
+def format_eta_seconds(seconds: int) -> str:
+    """Форматирует секунды в понятное время на русском языке."""
+    if seconds <= 0:
+        return "несколько секунд"
+    if seconds < 60:
+        return f"~{seconds} сек"
+    mins = seconds // 60
+    secs = seconds % 60
+    if mins < 60:
+        return f"~{mins} мин {secs} сек" if secs > 0 else f"~{mins} мин"
+    hours = mins // 60
+    rem_mins = mins % 60
+    return f"~{hours} ч {rem_mins} мин" if rem_mins > 0 else f"~{hours} ч"
+
+def parse_and_format_eta(eta_str: str) -> str:
+    """Преобразует ETA из любого формата (секунды, MM:SS, HH:MM:SS) в человекопонятный вид."""
+    if not eta_str:
+        return ""
+    clean_eta = strip_ansi(eta_str).strip()
+    if not clean_eta or clean_eta.upper() in ("NA", "UNKNOWN", "NONE", "N/A"):
+        return ""
+    if clean_eta in ("00:00", "0", "00"):
+        return "завершение..."
+    # Если это число секунд
+    try:
+        sec = int(float(clean_eta))
+        return format_eta_seconds(sec)
+    except ValueError:
+        pass
+    # Если формат MM:SS или HH:MM:SS
+    parts = clean_eta.split(":")
+    try:
+        if len(parts) == 2:
+            mins, secs = int(parts[0]), int(parts[1])
+            total_sec = mins * 60 + secs
+            return format_eta_seconds(total_sec)
+        elif len(parts) == 3:
+            hours, mins, secs = int(parts[0]), int(parts[1]), int(parts[2])
+            total_sec = hours * 3600 + mins * 60 + secs
+            return format_eta_seconds(total_sec)
+    except ValueError:
+        pass
+    return f"~{clean_eta}"
 
 def format_speed_eta(speed_str: str, eta_str: str) -> str:
+    """Формирует строку скорости и оставшегося времени скачивания."""
     parts = []
-    if speed_str and speed_str != "NA":
-        parts.append(f"⚡ {speed_str.strip()}")
-    if eta_str and eta_str != "NA":
-        parts.append(f"⏳ {eta_str.strip()}")
+    if speed_str:
+        clean_speed = strip_ansi(speed_str).strip()
+        if clean_speed and clean_speed.upper() not in ("NA", "UNKNOWN", "NONE", "N/A"):
+            parts.append(f"⚡ {clean_speed}")
+    if eta_str:
+        human_eta = parse_and_format_eta(eta_str)
+        if human_eta:
+            parts.append(f"⏳ {human_eta}")
     return " • ".join(parts)
 
 # --- ПРЯМЫЕ МЕДИА ССЫЛКИ И СОЦСЕТИ (REDDIT, PINTEREST, TWITTER) ---
@@ -659,6 +714,7 @@ async def download_direct_http(url: str, task_dir: str, status_msg: Message = No
         logging.warning(f"Blocked private/local URL attempt: {url}")
         return False
 
+    orig_url = url
     if any(h in url for h in ["redd.it", "preview.redd"]):
         url = resolve_reddit_cdn_url(url)
 
@@ -673,9 +729,17 @@ async def download_direct_http(url: str, task_dir: str, status_msg: Message = No
     try:
         timeout = aiohttp.ClientTimeout(total=120, connect=15)
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True) as resp:
+            target_url = url
+            resp = await session.get(target_url, allow_redirects=True)
+            if resp.status != 200 and target_url != orig_url:
+                resp.close()
+                target_url = orig_url
+                parsed = urllib.parse.urlparse(target_url)
+                resp = await session.get(target_url, allow_redirects=True)
+
+            try:
                 if resp.status != 200:
-                    logging.warning(f"Direct download failed: HTTP {resp.status} for {url}")
+                    logging.warning(f"Direct download failed: HTTP {resp.status} for {target_url}")
                     return False
 
                 # Защита от SSRF через редиректы
@@ -713,7 +777,7 @@ async def download_direct_http(url: str, task_dir: str, status_msg: Message = No
                 except (ValueError, TypeError):
                     total_size = 0
                 if total_size > MAX_WEB_FILE_SIZE_BYTES:
-                    logging.warning(f"Direct file exceeds 200MB ({total_size} bytes)")
+                    logging.warning(f"Direct file exceeds {MAX_FILE_SIZE_MB}MB ({total_size} bytes)")
                     return False
 
                 # Сохраняем оригинальное имя файла, если оно валидно
@@ -748,12 +812,16 @@ async def download_direct_http(url: str, task_dir: str, status_msg: Message = No
                                 elapsed = now - start_time
                                 speed = (downloaded / elapsed) if elapsed > 0 else 0
                                 speed_mb = speed / (1024 * 1024)
-                                eta = int((total_size - downloaded) / speed) if speed > 0 else 0
+                                if speed > 0 and total_size >= downloaded:
+                                    rem_sec = int((total_size - downloaded) / speed)
+                                    eta_display = format_eta_seconds(rem_sec)
+                                else:
+                                    eta_display = "несколько секунд"
                                 bar = make_progress_bar(percent)
                                 progress_text = (
                                     f"⚡ <b>Скачивание файла:</b>\n"
                                     f"<code>[{bar}] {percent:.1f}%</code>\n"
-                                    f"⚡ {speed_mb:.1f} МБ/с • ⏳ {eta} сек"
+                                    f"⚡ {speed_mb:.1f} МБ/с • ⏳ {eta_display}"
                                 )
                                 try:
                                     await status_msg.edit_text(progress_text, parse_mode="HTML")
@@ -761,6 +829,8 @@ async def download_direct_http(url: str, task_dir: str, status_msg: Message = No
                                     pass
 
                 return os.path.exists(dest_file) and os.path.getsize(dest_file) > 0
+            finally:
+                resp.close()
     except Exception as e:
         logging.error(f"Direct HTTP download error for {url}: {e}")
         if dest_file and os.path.exists(dest_file):
@@ -913,10 +983,11 @@ async def download_reddit_post(url: str, task_dir: str) -> bool:
                                     src = preview_images[0].get("source", {})
                                     img_url = html.unescape(src.get("url", ""))
                                     if img_url and not is_placeholder(img_url):
-                                        # i.redd.it предпочтительнее preview.redd.it
-                                        img_url = img_url.replace("preview.redd.it", "i.redd.it")
-                                        img_url = img_url.split("?")[0]  # убираем query параметры CDN
-                                        ok = await fetch_media(session, img_url, f"{task_dir}/00_reddit.jpg")
+                                        orig_img_url = img_url
+                                        direct_img_url = img_url.replace("preview.redd.it", "i.redd.it").split("?")[0]
+                                        ok = await fetch_media(session, direct_img_url, f"{task_dir}/00_reddit.jpg")
+                                        if not ok:
+                                            ok = await fetch_media(session, orig_img_url, f"{task_dir}/00_reddit.jpg")
                                         if ok:
                                             return True
 
@@ -1112,10 +1183,11 @@ async def process_download_job(job: DownloadJob):
         return
 
     # 2. Проверка свободного места на диске
-    _, _, free_bytes = shutil.disk_usage("/")
+    disk_check_path = DATA_DIR if os.path.exists(DATA_DIR) else "/"
+    _, _, free_bytes = shutil.disk_usage(disk_check_path)
     if free_bytes < MIN_FREE_DISK_BYTES:
         emergency_disk_cleanup()
-        _, _, free_after = shutil.disk_usage("/")
+        _, _, free_after = shutil.disk_usage(disk_check_path)
         if free_after < MIN_FREE_DISK_BYTES:
             try:
                 await job.status_msg.edit_text("⚠️ Сервер сейчас перегружен. Подожди 2-3 минуты, пока освободится место на диске.")
@@ -1169,6 +1241,7 @@ async def process_download_job(job: DownloadJob):
         if not downloaded:
             output_template = f"{task_dir}/%(autonumber)02d_%(id)s.%(ext)s"
             progress_args = [
+                "--color", "no_color",
                 "--progress-template", "DOWNLOAD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
                 "--newline"
             ]
@@ -1180,7 +1253,7 @@ async def process_download_job(job: DownloadJob):
                     "--extract-audio",
                     "--audio-format", "mp3",
                     "--audio-quality", "0",
-                    "--max-filesize", "200M",
+                    "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                     "--match-filter", "duration <= 7200 & !is_live",
                     "--no-playlist",
                     "--no-write-thumbnail",
@@ -1188,21 +1261,23 @@ async def process_download_job(job: DownloadJob):
                     "--no-write-info-json",
                     "--no-write-comments",
                     "--socket-timeout", "15",
-                    "--postprocessor-args", "ffmpeg:-threads 1"
+                    "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
             else:
+                max_web_size = max(45, int(MAX_FILE_SIZE_MB * 0.95))
+                max_web_approx = max(40, int(MAX_FILE_SIZE_MB * 0.90))
                 format_rule = (
                     "bestvideo[height>=1000][filesize_approx<46M]+(bestaudio[abr<=128]/bestaudio)/"
                     "best[height>=1000][filesize<47M]/"
                     "bestvideo[height>=700][height<1000][filesize_approx<46M]+(bestaudio[abr<=128]/bestaudio)/"
                     "best[height>=700][height<1000][filesize<47M]/"
-                    "bestvideo[height<=1080][filesize_approx<190M][filesize<=?190M]+(bestaudio[abr<=128]/bestaudio)/"
-                    "best[height<=1080][filesize<195M]/"
-                    "bestvideo[height<=720][filesize_approx<190M][filesize<=?190M]+(bestaudio[abr<=128]/bestaudio)/"
-                    "best[height<=720][filesize<195M]/"
-                    "bestvideo[height<=480][filesize_approx<190M][filesize<=?190M]+bestaudio/"
-                    "best[height<=480][filesize<195M]/"
-                    "best[filesize<195M]/"
+                    f"bestvideo[height<=1080][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+(bestaudio[abr<=128]/bestaudio)/"
+                    f"best[height<=1080][filesize<{max_web_size}M]/"
+                    f"bestvideo[height<=720][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+(bestaudio[abr<=128]/bestaudio)/"
+                    f"best[height<=720][filesize<{max_web_size}M]/"
+                    f"bestvideo[height<=480][filesize_approx<{max_web_approx}M][filesize<=?{max_web_size}M]+bestaudio/"
+                    f"best[height<=480][filesize<{max_web_size}M]/"
+                    f"best[filesize<{max_web_size}M]/"
                     "best"
                 )
                 is_youtube = "youtube.com" in url or "youtu.be" in url
@@ -1213,7 +1288,7 @@ async def process_download_job(job: DownloadJob):
                     *progress_args,
                     "--format", format_rule,
                     "--merge-output-format", "mp4",
-                    "--max-filesize", "200M",
+                    "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                     "--match-filter", "duration <= 7200 & !is_live",
                     *playlist_args,
                     "--no-write-thumbnail",
@@ -1221,7 +1296,7 @@ async def process_download_job(job: DownloadJob):
                     "--no-write-info-json",
                     "--no-write-comments",
                     "--socket-timeout", "15",
-                    "--postprocessor-args", "ffmpeg:-threads 1"
+                    "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
 
             if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
@@ -1244,7 +1319,7 @@ async def process_download_job(job: DownloadJob):
                     line_b = await stream.readline()
                     if not line_b:
                         break
-                    line = line_b.decode("utf-8", errors="ignore").strip()
+                    line = strip_ansi(line_b.decode("utf-8", errors="ignore")).strip()
                     if line.startswith("DOWNLOAD_PROGRESS:"):
                         data_part = line.split("DOWNLOAD_PROGRESS:", 1)[1]
                         parts = data_part.split("|")
@@ -1269,6 +1344,14 @@ async def process_download_job(job: DownloadJob):
                                     await job.status_msg.edit_text(text, parse_mode="HTML")
                                 except Exception:
                                     pass
+                    elif any(k in line for k in ("[Merger]", "[ExtractAudio]", "[Fixup", "[VideoConvertor]", "Deleting original file")):
+                        now = time.time()
+                        if now - last_edit_time >= 2.0:
+                            last_edit_time = now
+                            try:
+                                await job.status_msg.edit_text("⚙️ <b>Склеиваю и подготавливаю медиа...</b>\n⏳ Ещё несколько секунд", parse_mode="HTML")
+                            except Exception:
+                                pass
 
             async def read_stderr(stream):
                 chunks = []
@@ -1325,7 +1408,7 @@ async def process_download_job(job: DownloadJob):
             ff_cmd = [
                 "ffmpeg", "-y", "-i", videos[0],
                 "-vn", "-c:a", "libmp3lame", "-q:a", "2",
-                "-threads", "1", mp3_path
+                "-threads", str(FFMPEG_THREADS), mp3_path
             ]
             ff_proc = await asyncio.create_subprocess_exec(
                 *ff_cmd,
@@ -1384,7 +1467,7 @@ async def process_download_job(job: DownloadJob):
                 "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=480:480,setsar=1",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                "-threads", "1",
+                "-threads", str(FFMPEG_THREADS),
                 round_path
             ]
             r_proc = await asyncio.create_subprocess_exec(
@@ -1634,8 +1717,8 @@ async def notify_queue_positions():
         if getattr(pending_job, "is_active", False) or pending_job not in QUEUE_JOBS:
             continue
         pos = idx + 1
-        est_time = ((pos - 1) // NUM_WORKERS + 1) * 20
-        new_text = f"⏳ Твоя очередь приближается! Позиция: #{pos}. Ожидание: ~{est_time} сек."
+        est_time_str = format_eta_seconds(((pos - 1) // NUM_WORKERS + 1) * 20)
+        new_text = f"⏳ Твоя очередь приближается! Позиция: #{pos}. Ожидание: {est_time_str}."
         if pending_job.last_status_text != new_text:
             try:
                 await pending_job.status_msg.edit_text(new_text)
@@ -1699,7 +1782,7 @@ async def extract_audio_callback(callback: CallbackQuery):
         await callback.answer("🎵 Извлекаю MP3...")
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", info["path"],
-            "-vn", "-c:a", "libmp3lame", "-q:a", "2", "-threads", "1",
+            "-vn", "-c:a", "libmp3lame", "-q:a", "2", "-threads", str(FFMPEG_THREADS),
             out_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1759,7 +1842,7 @@ async def extract_round_callback(callback: CallbackQuery):
             "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=480:480,setsar=1",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-            "-threads", "1",
+            "-threads", str(FFMPEG_THREADS),
             out_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -1927,8 +2010,8 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
             status_msg = await message.answer(status_text)
         else:
             pos = current_queue_len + 1
-            est_time = ((pos - 1) // NUM_WORKERS + 1) * 20
-            status_text = f"⏳ Ты в очереди: позиция #{pos}. Ожидание: ~{est_time} сек."
+            est_time_str = format_eta_seconds(((pos - 1) // NUM_WORKERS + 1) * 20)
+            status_text = f"⏳ Ты в очереди: позиция #{pos}. Ожидание: {est_time_str}."
             status_msg = await message.answer(status_text)
 
         job = DownloadJob(message=message, status_msg=status_msg, url=url, user_id=user_id, mode=mode, last_status_text=status_text)
@@ -2314,16 +2397,19 @@ async def download_for_inline(url: str) -> dict | None:
         # 1. Direct media
         if is_direct_media_url(url):
             downloaded = await download_direct_http(url, task_dir)
-        # 2. Pinterest
+        # 2. Reddit (посты, фото-галереи, видео)
+        if not downloaded and any(d in url for d in ["reddit.com", "redd.it"]):
+            downloaded = await download_reddit_post(url, task_dir)
+        # 3. Pinterest
         if not downloaded and any(d in url for d in ["pinterest.com", "pin.it"]):
             downloaded = await download_pinterest_photo(url, task_dir)
-        # 3. Twitter
+        # 4. Twitter
         if not downloaded and any(d in url for d in ["twitter.com", "x.com"]):
             downloaded = await download_twitter_media(url, task_dir)
-        # 4. TikTok
+        # 5. TikTok
         if not downloaded and any(d in url for d in ["tiktok.com", "douyin.com"]):
             downloaded = await download_tiktok_api(url, task_dir)
-        # 5. yt-dlp (быстрый пресет 720p/480p)
+        # 6. yt-dlp (быстрый пресет 720p/480p)
         if not downloaded:
             output_template = f"{task_dir}/%(autonumber)02d_%(id)s.%(ext)s"
             format_rule = "bestvideo[height<=720][filesize<45M]+bestaudio/best[height<=720][filesize<45M]/best[filesize<45M]/best"
@@ -2339,7 +2425,7 @@ async def download_for_inline(url: str) -> dict | None:
                 "--no-write-description",
                 "--no-write-info-json",
                 "--socket-timeout", "10",
-                "--postprocessor-args", "ffmpeg:-threads 2",
+                "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}",
                 url
             ]
             if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
