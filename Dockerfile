@@ -5,7 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     unzip \
     ca-certificates && \
-    curl -fsSL https://github.com/denoland/deno/releases/download/v2.9.6/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip && \
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then DENO_ARCH="aarch64"; else DENO_ARCH="x86_64"; fi && \
+    curl -fsSL "https://github.com/denoland/deno/releases/download/v2.9.6/deno-${DENO_ARCH}-unknown-linux-gnu.zip" -o /tmp/deno.zip && \
     unzip -o /tmp/deno.zip -d /usr/local/bin && \
     chmod +x /usr/local/bin/deno && \
     rm -f /tmp/deno.zip && \

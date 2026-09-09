@@ -392,6 +392,11 @@ def clean_cooldowns():
 
 # --- ВЕБ-СЕРВЕР ---
 
+async def handle_root(request: web.Request) -> web.Response:
+    if BOT_USERNAME:
+        raise web.HTTPFound(f"https://t.me/{BOT_USERNAME}")
+    return web.Response(text="Universal Media Downloader Bot Web Server")
+
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
@@ -447,6 +452,8 @@ async def handle_thumb(request: web.Request) -> web.StreamResponse:
 
 async def start_web_server():
     app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_head("/", handle_root)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/dl/thumb/{token}.jpg", handle_thumb)
     app.router.add_get("/dl/{token}/{filename}", handle_download)
@@ -598,6 +605,8 @@ def parse_ytdlp_error(stderr_text: str) -> str:
         return "Видео заблокировано правообладателем по авторским правам."
     if "join this channel" in lower or "members-only" in lower:
         return "Видео доступно только спонсорам канала."
+    if "reddit" in lower or "account authentication is required" in lower:
+        return "Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна."
     if "max-filesize" in lower:
         return f"Файл превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ)."
     return f"Не удалось скачать. Видео приватное, превышен лимит {MAX_FILE_SIZE_MB} МБ или сервис временно недоступен."
@@ -1217,13 +1226,17 @@ async def process_download_job(job: DownloadJob):
         downloaded = False
         last_ytdlp_error = ""
 
-        # 1. Прямой загрузчик медиа (mp4, mp3, jpg, cdn redd.it, imgur и т.д.)
+        # 1. Заглушка для Reddit (HTTP 403 Forbidden со стороны серверов)
+        if any(d in url.lower() for d in ["reddit.com", "redd.it"]):
+            try:
+                await job.status_msg.edit_text("⚠️ Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна.")
+            except Exception:
+                pass
+            return
+
+        # 2. Прямой загрузчик медиа (mp4, mp3, jpg, imgur и т.д.)
         if is_direct_media_url(url) and job.mode != "round":
             downloaded = await download_direct_http(url, task_dir, status_msg=job.status_msg)
-
-        # 2. Reddit (посты, шортлинки /s/, галереи, видео)
-        if not downloaded and any(d in url for d in ["reddit.com", "redd.it"]) and job.mode != "round":
-            downloaded = await download_reddit_post(url, task_dir)
 
         # 3. Pinterest (фото высокого разрешения)
         if not downloaded and any(d in url for d in ["pinterest.com", "pin.it"]) and job.mode != "round":
@@ -2393,14 +2406,13 @@ async def download_for_inline(url: str) -> dict | None:
     task_dir = f"/tmp/{uuid.uuid4().hex}"
     os.makedirs(task_dir, exist_ok=True)
     try:
+        if any(d in url.lower() for d in ["reddit.com", "redd.it"]):
+            return None
         downloaded = False
         # 1. Direct media
         if is_direct_media_url(url):
             downloaded = await download_direct_http(url, task_dir)
-        # 2. Reddit (посты, фото-галереи, видео)
-        if not downloaded and any(d in url for d in ["reddit.com", "redd.it"]):
-            downloaded = await download_reddit_post(url, task_dir)
-        # 3. Pinterest
+        # 2. Pinterest
         if not downloaded and any(d in url for d in ["pinterest.com", "pin.it"]):
             downloaded = await download_pinterest_photo(url, task_dir)
         # 4. Twitter
@@ -2676,12 +2688,13 @@ async def inline_query_handler(query: InlineQuery):
 
         warning = check_unsupported_url(url)
         if warning:
+            warn_title = "⚠️ Сервис Reddit заблокирован" if any(d in url.lower() for d in ["reddit.com", "redd.it"]) else "⚠️ Сервис не поддерживается"
             await query.answer(
                 results=[
                     InlineQueryResultArticle(
                         id="warning",
-                        title="⚠️ Сервис не поддерживается",
-                        description=warning[:80],
+                        title=warn_title,
+                        description=warning,
                         input_message_content=InputTextMessageContent(
                             message_text=f"⚠️ {warning}"
                         )
@@ -2929,6 +2942,25 @@ async def fallback_text_handler(message: Message):
     if message.from_user.id == ADMIN_ID and message.text.startswith("/"):
         return
     await add_user(message.from_user.id)
+    text = (message.text or "").strip()
+    lower = text.lower()
+
+    # Быстрый перехват Reddit (даже если ссылка прислана без https://)
+    if any(d in lower for d in ["reddit.com", "redd.it"]):
+        await message.answer("⚠️ Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна.")
+        return
+
+    # Проверка, если прислана ссылка на поддерживаемый сервис без префикса https://
+    url_match = re.search(r'(?:^|\s)((?:[a-zA-Z0-9-]+\.)+(?:com|ru|org|net|me|io|co|app|be|tv|ly|cc)(?:/[^\s]*)?)', text)
+    if url_match:
+        extracted = "https://" + url_match.group(1).rstrip(',)[]">.')
+        warning = check_unsupported_url(extracted)
+        if warning:
+            await message.answer(f"⚠️ {warning}")
+            return
+        await queue_download(message, extracted, mode="auto")
+        return
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📖 Как пользоваться", callback_data="open_help")],
         [InlineKeyboardButton(text="💬 Написать в поддержку", callback_data="open_support")]

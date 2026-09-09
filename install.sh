@@ -172,6 +172,10 @@ if [[ "$SETUP_CADDY_CHOICE" =~ ^[YyДд]$ ]]; then
             WEB_BASE_URL="https://${DOMAIN_NAME}"
             echo -e "${GREEN}✅ Домен принят: ${BOLD}${DOMAIN_NAME}${NC} (URL: ${WEB_BASE_URL})"
             echo -e "${YELLOW}ℹ️ Убедитесь, что A-запись домена ${DOMAIN_NAME} в DNS указывает на IP сервера: ${BOLD}${EXTERNAL_IP}${NC}"
+            if command -v ss &>/dev/null && ss -tuln 2>/dev/null | grep -qE ':(80|443)\s'; then
+                echo -e "${YELLOW}⚠️ Внимание: порт 80 или 443 уже занят на сервере другим процессом (например, Nginx/Apache).${NC}"
+                echo -e "${YELLOW}Для корректной работы Caddy остановите их: ${BOLD}systemctl stop nginx apache2${NC}"
+            fi
             break
         else
             echo -e "${RED}❌ Некорректный формат домена! Введите домен без http:// (например: bot.example.com)${NC}"
@@ -189,12 +193,18 @@ mkdir -p "${INSTALL_DIR}/data/web_downloads"
 mkdir -p "${INSTALL_DIR}/data/cache"
 chmod 755 "${INSTALL_DIR}/data"
 
-# Генерация .env
+# Настройка путей данных и портов для Docker или Systemd
 COMPOSE_PROFILES=""
 HOST_PORT_BIND="8080"
 if [ "$USE_CADDY" = true ]; then
     COMPOSE_PROFILES="caddy"
     HOST_PORT_BIND="127.0.0.1:8080"
+fi
+
+if [ "$DEPLOY_METHOD" -eq 1 ]; then
+    DATA_DIR_VAL="/app/data"
+else
+    DATA_DIR_VAL="${INSTALL_DIR}/data"
 fi
 
 cat << ENV_CONFIG > "${INSTALL_DIR}/.env"
@@ -204,7 +214,7 @@ ADMIN_ID=${ADMIN_ID}
 BOT_USERNAME=
 WEB_BASE_URL=${WEB_BASE_URL}
 WEB_PORT=8080
-DATA_DIR=${INSTALL_DIR}/data
+DATA_DIR=${DATA_DIR_VAL}
 
 # Docker Compose профили
 COMPOSE_PROFILES=${COMPOSE_PROFILES}
