@@ -49,8 +49,8 @@ WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 
 # Лимиты и квоты для безопасности диска и производительности
 MAX_TG_FILE_SIZE_BYTES = 49 * 1024 * 1024        # 49 МБ (лимит отправки Telegram Bot API)
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "200"))
-MAX_WEB_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024      # Лимит для веб-скачивания (по умолчанию 200 МБ)
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "250"))
+MAX_WEB_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024      # Лимит для веб-скачивания (по умолчанию 250 МБ)
 WEB_TTL_SECONDS = int(os.getenv("WEB_TTL_SECONDS", str(7 * 60)))                         # 7 минут для веб-ссылок
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(4 * 60)))                       # 4 минуты для кнопок MP3/Кружочек
 
@@ -1435,35 +1435,42 @@ async def process_download_job(job: DownloadJob):
             else:
                 max_web_size = max(45, int(MAX_FILE_SIZE_MB * 0.95))
                 max_web_approx = max(40, int(MAX_FILE_SIZE_MB * 0.90))
+                yt_1080_limit = max(180, int(MAX_FILE_SIZE_MB * 0.90))
+                yt_720_limit = max(195, int(MAX_FILE_SIZE_MB * 0.98))
 
                 if is_youtube and job.audio_format_id:
-                    # Приоритет качества: 1080p -> 720p. До 480p/360p опускаемся ТОЛЬКО если 720p превышает 200 МБ
+                    # Приоритет качества: 1080p -> 720p со склейкой выбранной аудиодорожки.
+                    # До 480p/360p опускаемся ТОЛЬКО если более высокое качество недоступно или превышает лимит.
+                    # КРИТИЧЕСКИ ВАЖНО: Никаких отдельных job.audio_format_id без видео!
                     format_rule = (
-                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{job.audio_format_id}/"
-                        f"bestvideo[height=1080][filesize_approx<190M]+{job.audio_format_id}/"
-                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{job.audio_format_id}/"
-                        f"bestvideo[height=720][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{job.audio_format_id}/"
+                        f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{job.audio_format_id}/"
+                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
+                        f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
                         f"bestvideo[height=720]+{job.audio_format_id}/"
-                        f"bestvideo[height<=1080][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
                         f"bestvideo[height<=720]+{job.audio_format_id}/"
-                        f"bestvideo[height<=480][filesize_approx<195M]+{job.audio_format_id}/"
+                        f"bestvideo[height<=480]+{job.audio_format_id}/"
                         f"bestvideo[height<=360]+{job.audio_format_id}/"
-                        f"{job.audio_format_id}/"
+                        f"bestvideo+{job.audio_format_id}/"
+                        f"best[height<=720]/"
                         "best"
                     )
                 elif is_youtube:
                     # YouTube видео без ручного выбора дорожки (одиночный трек)
                     audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                     format_rule = (
-                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{audio_subrule}/"
-                        f"bestvideo[height=1080][filesize_approx<190M]+{audio_subrule}/"
-                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{audio_subrule}/"
-                        f"bestvideo[height=720][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
+                        f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
+                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
+                        f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
                         f"bestvideo[height=720]+{audio_subrule}/"
-                        f"bestvideo[height<=1080][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
                         f"bestvideo[height<=720]+{audio_subrule}/"
-                        f"bestvideo[height<=480][filesize_approx<195M]+{audio_subrule}/"
+                        f"bestvideo[height<=480]+{audio_subrule}/"
                         f"bestvideo[height<=360]+{audio_subrule}/"
+                        f"bestvideo+{audio_subrule}/"
+                        f"best[height<=720]/"
                         "best"
                     )
                 else:
@@ -1490,7 +1497,6 @@ async def process_download_job(job: DownloadJob):
                     *progress_args,
                     "--format", format_rule,
                     "--merge-output-format", "mp4",
-                    "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                     "--match-filter", "duration <= 7200 & !is_live",
                     *playlist_args,
                     "--no-write-thumbnail",
@@ -1500,6 +1506,8 @@ async def process_download_job(job: DownloadJob):
                     "--socket-timeout", "15",
                     "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
+                if not is_youtube:
+                    cmd.extend(["--max-filesize", f"{MAX_FILE_SIZE_MB}M"])
 
             if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
                 cmd.extend(["--cookies", COOKIES_PATH])
@@ -1830,13 +1838,23 @@ async def process_download_job(job: DownloadJob):
 
                 else:
                     await job.message.answer(
-                        f"⚠️ Видео ({file_size_mb} МБ) превышает лимит сервера (200 МБ).\n"
+                        f"⚠️ Видео ({file_size_mb} МБ) превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ).\n"
                         f"Для таких тяжелых видео можно скачать только аудиодорожку:\n<code>/audio {url}</code>",
                         parse_mode="HTML"
                     )
                     await increment_stat("failed")
 
         elif audios:
+            # Защита: если для видео с YouTube по какой-то причине отсутствует видеофайл в обычном режиме, не отправлять голый звук!
+            if is_youtube and job.mode != "audio":
+                logging.warning(f"YouTube job in mode {job.mode} produced only audio without video: {audios}")
+                try:
+                    await job.status_msg.edit_text("❌ Не удалось собрать видеопоток со звуком. Попробуй ещё раз.")
+                except Exception:
+                    pass
+                await increment_stat("failed")
+                return
+
             for aud in audios:
                 base_name = os.path.basename(aud)
                 file_size = os.path.getsize(aud)
@@ -3008,16 +3026,20 @@ async def download_for_inline(url: str) -> dict | None:
 
             if is_youtube:
                 audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
+                yt_1080_limit = max(180, int(MAX_FILE_SIZE_MB * 0.90))
+                yt_720_limit = max(195, int(MAX_FILE_SIZE_MB * 0.98))
                 format_rule = (
-                    f"bestvideo[height=1080][vcodec^=avc][filesize_approx<190M]+{audio_subrule}/"
-                    f"bestvideo[height=1080][filesize_approx<190M]+{audio_subrule}/"
-                    f"bestvideo[height=720][vcodec^=avc][filesize_approx<195M]+{audio_subrule}/"
-                    f"bestvideo[height=720][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
+                    f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
+                    f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
+                    f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
                     f"bestvideo[height=720]+{audio_subrule}/"
-                    f"bestvideo[height<=1080][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
                     f"bestvideo[height<=720]+{audio_subrule}/"
-                    f"bestvideo[height<=480][filesize_approx<195M]+{audio_subrule}/"
+                    f"bestvideo[height<=480]+{audio_subrule}/"
                     f"bestvideo[height<=360]+{audio_subrule}/"
+                    f"bestvideo+{audio_subrule}/"
+                    f"best[height<=720]/"
                     "best"
                 )
             else:
@@ -3038,7 +3060,6 @@ async def download_for_inline(url: str) -> dict | None:
                 "--format", format_rule,
                 "--merge-output-format", "mp4",
                 "--output", output_template,
-                "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                 "--no-write-thumbnail",
                 "--no-write-description",
                 "--no-write-info-json",
@@ -3046,6 +3067,8 @@ async def download_for_inline(url: str) -> dict | None:
                 "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}",
                 url
             ]
+            if not is_youtube:
+                cmd.extend(["--max-filesize", f"{MAX_FILE_SIZE_MB}M"])
             if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
                 cmd.extend(["--cookies", COOKIES_PATH])
 
