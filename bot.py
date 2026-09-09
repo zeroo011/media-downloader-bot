@@ -437,6 +437,26 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
     token = request.match_info.get("token")
     info = DOWNLOAD_LINKS.get(token)
     now = time.time()
+
+    if not info or not os.path.exists(info.get("path", "")):
+        # Поиск файла на диске, если запись в памяти сбросилась при перезапуске
+        matched = glob.glob(f"{WEB_DOWNLOADS_DIR}/{token}*")
+        disk_path = None
+        for mf in matched:
+            if not mf.endswith("_thumb.jpg"):
+                disk_path = mf
+                break
+        if disk_path and os.path.exists(disk_path):
+            fn = request.match_info.get("filename") or os.path.basename(disk_path)
+            if fn.startswith(f"{token}_"):
+                fn = fn[len(f"{token}_"):]
+            info = {
+                "path": disk_path,
+                "filename": fn,
+                "expire_at": now + WEB_TTL_SECONDS
+            }
+            DOWNLOAD_LINKS[token] = info
+
     if not info or now > info["expire_at"] or not os.path.exists(info["path"]):
         html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -469,7 +489,7 @@ p{color:#94a3b8;line-height:1.6;}
         info["path"],
         headers={
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
+            "Content-Disposition": disposition
         }
     )
 
@@ -2492,25 +2512,34 @@ async def download_for_inline(url: str) -> dict | None:
             downloaded = await download_tiktok_api(url, task_dir)
         # 6. yt-dlp (быстрый пресет 720p/480p)
         if not downloaded:
-            output_template = f"{task_dir}/%(autonumber)02d_%(id)s.%(ext)s"
-            format_rule = (
-                "bestvideo[height<=720][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
-                "best[height<=720][filesize<44M]/"
-                "bestvideo[height<=480][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
-                "best[height<=480][filesize<44M]/"
-                "bestvideo[height<=360][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
-                "best[height<=360][filesize<44M]/"
-                f"bestvideo[height<=720][filesize_approx<{MAX_FILE_SIZE_MB}M]+bestaudio/"
-                f"best[height<=720][filesize<{MAX_FILE_SIZE_MB}M]/"
-                f"best[filesize<{MAX_FILE_SIZE_MB}M]/"
-                "best"
-            )
-            is_youtube = "youtube.com" in url or "youtu.be" in url
+            output_template = f"{task_dir}/%(title).80s.%(ext)s"
+            is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
             playlist_args = ["--no-playlist"] if is_youtube else ["--yes-playlist", "--playlist-end", "20"]
+
+            if is_youtube:
+                format_rule = (
+                    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
+                    "bestvideo[height<=720]+bestaudio/"
+                    "best[height<=720]/"
+                    "best"
+                )
+            else:
+                format_rule = (
+                    "bestvideo[height<=720][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
+                    "best[height<=720][filesize<44M]/"
+                    "bestvideo[height<=480][filesize_approx<42M]+(bestaudio[abr<=128]/bestaudio)/"
+                    "best[height<=480][filesize<44M]/"
+                    f"bestvideo[height<=720][filesize_approx<{MAX_FILE_SIZE_MB}M]+bestaudio/"
+                    f"best[height<=720][filesize<{MAX_FILE_SIZE_MB}M]/"
+                    f"best[filesize<{MAX_FILE_SIZE_MB}M]/"
+                    "best"
+                )
+
             cmd = [
                 "yt-dlp",
                 *playlist_args,
                 "--format", format_rule,
+                "--merge-output-format", "mp4",
                 "--output", output_template,
                 "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
                 "--no-write-thumbnail",
@@ -2628,10 +2657,14 @@ async def download_for_inline(url: str) -> dict | None:
             video_items = []
             for idx, vid in enumerate(videos[:10]):
                 item_token = f"{token}_{idx:02d}"
-                target_ext = os.path.splitext(vid)[1].lower()
-                dest_file = f"{WEB_DOWNLOADS_DIR}/{item_token}.mp4"
+                raw_base = os.path.splitext(os.path.basename(vid))[0]
+                # Очистка названия от системных спецсимволов для безопасного сохранения
+                safe_name = re.sub(r'[^a-zA-Z0-9а-яА-ЯёЁ_\s\.-]', '_', raw_base).strip() or f"video_{idx+1}"
+                dest_fn = f"{safe_name}.mp4"
+                dest_file = f"{WEB_DOWNLOADS_DIR}/{item_token}_{dest_fn}"
                 thumb_path = f"{WEB_DOWNLOADS_DIR}/{item_token}_thumb.jpg"
 
+                target_ext = os.path.splitext(vid)[1].lower()
                 if target_ext != ".mp4":
                     ffmpeg_proc = await asyncio.create_subprocess_exec(
                         "ffmpeg", "-y", "-i", vid, "-c", "copy", dest_file,
@@ -2647,6 +2680,7 @@ async def download_for_inline(url: str) -> dict | None:
                 else:
                     shutil.copy2(vid, dest_file)
 
+                # Генерация превью первого кадра
                 t_proc = await asyncio.create_subprocess_exec(
                     "ffmpeg", "-y", "-ss", "00:00:01", "-i", dest_file, "-vframes", "1", "-q:v", "2", thumb_path,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -2659,13 +2693,17 @@ async def download_for_inline(url: str) -> dict | None:
 
                 fsize = os.path.getsize(dest_file) if os.path.exists(dest_file) else 0
                 fsize_mb = round(fsize / (1024 * 1024), 1)
-                is_large = fsize > MAX_TG_FILE_SIZE_BYTES
+
+                is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
+                is_large = is_youtube or fsize > 40 * 1024 * 1024
+
                 keys = extract_media_cache_keys(url)
 
                 DOWNLOAD_LINKS[item_token] = {
                     "path": dest_file,
                     "thumb_path": thumb_path if os.path.exists(thumb_path) else None,
-                    "filename": f"video_{idx+1}.mp4",
+                    "filename": dest_fn,
+                    "title": raw_base,
                     "expire_at": now + WEB_TTL_SECONDS,
                     "size_mb": fsize_mb,
                     "user_id": 0,
@@ -2677,18 +2715,18 @@ async def download_for_inline(url: str) -> dict | None:
                 if is_large:
                     payload = json.dumps({
                         "token": item_token,
-                        "filename": f"video_{idx+1}.mp4",
+                        "filename": dest_fn,
                         "size_mb": fsize_mb,
                         "has_thumb": os.path.exists(thumb_path)
                     })
-                    await save_media_cache(url, payload, "web_video", os.path.basename(vid))
+                    await save_media_cache(url, payload, "web_video", raw_base)
 
                 video_items.append({
                     "token": item_token,
-                    "filename": f"video_{idx+1}.mp4",
+                    "filename": dest_fn,
                     "index": idx + 1,
                     "total": len(videos[:10]),
-                    "title": os.path.basename(vid),
+                    "title": raw_base,
                     "size_mb": fsize_mb,
                     "is_large": is_large
                 })
@@ -2771,37 +2809,45 @@ async def download_for_inline(url: str) -> dict | None:
 
 
 def make_web_download_article(token: str, filename: str, size_mb: float, title: str | None = None, bot_sign: str = "бота") -> InlineQueryResultArticle:
-    """Создает карточку для скачивания больших файлов (> 50 МБ) через инлайн-режим."""
-    dl_url = f"{WEB_BASE_URL}/dl/{token}/{filename}"
+    """Создает карточку для скачивания файлов через инлайн-режим (для YouTube и файлов > 40 МБ)."""
+    clean_url_fn = urllib.parse.quote(filename)
+    dl_url = f"{WEB_BASE_URL}/dl/{token}/{clean_url_fn}"
     th_url = f"{WEB_BASE_URL}/dl/thumb/{token}.jpg"
     thumb_path = f"{WEB_DOWNLOADS_DIR}/{token}_thumb.jpg"
     thumb_to_use = th_url if os.path.exists(thumb_path) else None
 
     clean_title = (title or filename).strip()
+    if clean_title.lower().endswith(".mp4"):
+        clean_title = clean_title[:-4].strip()
+    clean_title = clean_title.replace("_", " ")
+
     if len(clean_title) > 60:
-        clean_title = clean_title[:57] + "..."
+        display_title = clean_title[:57] + "..."
+    else:
+        display_title = clean_title
 
     display_size = f"{size_mb:.1f}" if isinstance(size_mb, (int, float)) else str(size_mb)
 
     card_text = (
+        f"📹 <b>Видео готово!</b>\n\n"
         f"🎬 <b>{html.escape(clean_title)}</b>\n"
-        f"📦 Размер: <b>{display_size} МБ</b>\n\n"
-        f"⚠️ <i>Файл превышает 50 МБ (лимит Telegram для инлайн-видео).</i>\n"
+        f"📦 Размер: <b>{display_size} МБ</b> (лимит отправки в Telegram — 50 МБ).\n\n"
         f"⬇️ <b>Прямая ссылка для скачивания:</b>\n"
-        f"🔗 <a href=\"{dl_url}\">{html.escape(filename)}</a>\n\n"
+        f"🔗 <a href=\"{dl_url}\">Скачать напрямую с сервера</a>\n\n"
+        f"⏳ <i>Ссылка действует 7 минут.</i>\n"
         f"<i>Скачано через {bot_sign}</i>"
     )
 
     buttons = [
-        [InlineKeyboardButton(text=f"⬇️ Скачать видео ({display_size} МБ)", url=dl_url)]
+        [InlineKeyboardButton(text=f"📥 Скачать файл ({display_size} МБ)", url=dl_url)]
     ]
     if BOT_USERNAME:
         buttons.append([InlineKeyboardButton(text="🤖 Открыть бота", url=f"https://t.me/{BOT_USERNAME}")])
 
     return InlineQueryResultArticle(
         id=f"wl_{token}",
-        title=f"🎬 Скачать видео ({display_size} МБ)",
-        description=f"{clean_title} • Доступно по прямой ссылке",
+        title=f"🎬 {display_title} ({display_size} МБ)",
+        description=f"📥 Скачать напрямую с сервера ({display_size} МБ)",
         thumbnail_url=thumb_to_use,
         input_message_content=InputTextMessageContent(
             message_text=card_text,
@@ -2879,13 +2925,19 @@ async def inline_query_handler(query: InlineQuery):
                     t = data.get("token")
                     fn = data.get("filename", "video.mp4")
                     size_mb = data.get("size_mb", 0)
-                    file_path = f"{WEB_DOWNLOADS_DIR}/{t}.mp4"
+                    file_path = None
                     dl_entry = DOWNLOAD_LINKS.get(t)
-                    if dl_entry:
-                        file_path = dl_entry.get("path", file_path)
+                    if dl_entry and os.path.exists(dl_entry.get("path", "")):
+                        file_path = dl_entry["path"]
                         fn = dl_entry.get("filename", fn)
                         size_mb = dl_entry.get("size_mb", size_mb)
-                    if t and os.path.exists(file_path):
+                    else:
+                        matched = glob.glob(f"{WEB_DOWNLOADS_DIR}/{t}*")
+                        for mf in matched:
+                            if not mf.endswith("_thumb.jpg") and os.path.exists(mf):
+                                file_path = mf
+                                break
+                    if t and file_path and os.path.exists(file_path):
                         results.append(make_web_download_article(t, fn, size_mb, title, bot_sign))
                 except Exception as e:
                     logging.warning(f"Error parsing cached web_video: {e}")
@@ -2933,7 +2985,8 @@ async def inline_query_handler(query: InlineQuery):
         if active_dl:
             t, item = active_dl
             fsize_mb = item.get("size_mb") or (round(os.path.getsize(item["path"]) / (1024 * 1024), 1) if os.path.exists(item.get("path", "")) else 0)
-            is_large = item.get("is_large", False) or fsize_mb > 49.0
+            is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
+            is_large = item.get("is_large", False) or is_youtube or fsize_mb > 40.0
             fn = item.get("filename", "video.mp4")
             v_title = item.get("title") or fn
 
@@ -3067,7 +3120,8 @@ async def inline_query_handler(query: InlineQuery):
                     fn = it["filename"]
                     idx = it.get("index", 1)
                     size_mb = it.get("size_mb", 0)
-                    is_large = it.get("is_large", False) or size_mb > 49.0
+                    is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
+                    is_large = it.get("is_large", False) or is_youtube or size_mb > 40.0
                     v_title = it.get("title") or (f"Видео {idx}/{total}" if total > 1 else "Видео")
 
                     if is_large:
