@@ -50,7 +50,6 @@ CPU_CORES=$(nproc 2>/dev/null || echo 1)
 TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
 TOTAL_SWAP_MB=$(free -m | awk '/^Swap:/{print $2}')
 DISK_FREE_HUMAN=$(df -h / | awk 'NR==2 {print $4}')
-DISK_FREE_MB=$(df -m / | awk 'NR==2 {print $4}')
 
 echo -e "   • Процессор:   ${BOLD}${CPU_CORES} vCPU${NC}"
 echo -e "   • Память RAM:  ${BOLD}${TOTAL_RAM_MB} МБ${NC}"
@@ -85,7 +84,6 @@ fi
 # 4. Выбор профиля производительности
 echo -e "\n${BLUE}⚙️ Выбор профиля оптимизации под ресурсы сервера:${NC}"
 
-# Рекомендуемый профиль на основе ресурсов
 if [ "$CPU_CORES" -ge 4 ] && [ "$TOTAL_RAM_MB" -ge 7000 ]; then
     REC_PROFILE=3
     REC_TEXT="High"
@@ -150,7 +148,7 @@ while true; do
     if [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{35,}$ ]]; then
         break
     else
-        echo -e "${RED}❌ Неверный формат токена бота! Пример правильного формата: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ1234567890${NC}"
+        echo -e "${RED}❌ Неверный формат токена бота! Пример: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ1234567890${NC}"
     fi
 done
 
@@ -167,11 +165,37 @@ done
 
 # Определение внешнего IP
 EXTERNAL_IP=$(curl -s -m 4 https://api.ipify.org 2>/dev/null || curl -s -m 4 https://ifconfig.me 2>/dev/null || echo "127.0.0.1")
-DEFAULT_WEB_URL="http://${EXTERNAL_IP}:8080"
 
-read -r -p "Публичный URL для веб-скачивания и инлайн-превью [по умолчанию: ${DEFAULT_WEB_URL}]: " INPUT_WEB_URL
-WEB_BASE_URL=${INPUT_WEB_URL:-$DEFAULT_WEB_URL}
-WEB_BASE_URL=$(echo "$WEB_BASE_URL" | sed 's:/*$::')
+# Настройка домена и Caddy HTTPS
+echo -e "\n${BLUE}🌐 Настройка домена и веб-сервера (для инлайн-превью и файлов > 50 МБ):${NC}"
+echo -e "Для корректной работы инлайн-режима Telegram (карточки фото и видео) необходим ${BOLD}HTTPS${NC}."
+echo -e "Скрипт может автоматически установить веб-сервер ${BOLD}Caddy${NC} и выпустить бесплатный SSL (Let's Encrypt)."
+read -r -p "Хотите подключить свой домен и настроить Caddy HTTPS? [Y/n]: " SETUP_CADDY_CHOICE
+SETUP_CADDY_CHOICE=${SETUP_CADDY_CHOICE:-Y}
+
+USE_CADDY=false
+DOMAIN_NAME=""
+
+if [[ "$SETUP_CADDY_CHOICE" =~ ^[YyДд]$ ]]; then
+    while true; do
+        read -r -p "Введите ваш домен (например, bot.mydomain.com): " DOMAIN_NAME
+        DOMAIN_NAME=$(echo "$DOMAIN_NAME" | tr -d '[:space:]' | sed -e 's|^https\?://||' -e 's|/.*$||')
+        if [[ "$DOMAIN_NAME" =~ ^[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}$ ]]; then
+            USE_CADDY=true
+            WEB_BASE_URL="https://${DOMAIN_NAME}"
+            echo -e "${GREEN}✅ Домен принят: ${BOLD}${DOMAIN_NAME}${NC} (URL: ${WEB_BASE_URL})"
+            echo -e "${YELLOW}ℹ️ Убедитесь, что A-запись домена ${DOMAIN_NAME} в DNS указывает на IP сервера: ${BOLD}${EXTERNAL_IP}${NC}"
+            break
+        else
+            echo -e "${RED}❌ Некорректный формат домена! Введите домен без http:// (например: bot.example.com)${NC}"
+        fi
+    done
+else
+    DEFAULT_WEB_URL="http://${EXTERNAL_IP}:8080"
+    read -r -p "Публичный URL для веб-скачивания [по умолчанию: ${DEFAULT_WEB_URL}]: " INPUT_WEB_URL
+    WEB_BASE_URL=${INPUT_WEB_URL:-$DEFAULT_WEB_URL}
+    WEB_BASE_URL=$(echo "$WEB_BASE_URL" | sed 's:/*$::')
+fi
 
 # 6. Установка системных зависимостей
 echo -e "\n${BLUE}📦 Установка системных пакетов (ffmpeg, python3, venv, pip, curl)...${NC}"
@@ -186,7 +210,46 @@ apt-get install -y --no-install-recommends \
     curl \
     ca-certificates
 
-# 7. Развертывание виртуального окружения Python
+# 7. Установка и настройка веб-сервера Caddy (если выбран домен)
+if [ "$USE_CADDY" = true ]; then
+    echo -e "\n${BLUE}🌐 Установка и настройка веб-сервера Caddy (Reverse Proxy + Auto-SSL)...${NC}"
+    if ! command -v caddy &>/dev/null; then
+        echo -e "${CYAN}📥 Добавление репозитория Caddy...${NC}"
+        apt-get install -y debian-keyring debian-archive-keyring apt-transport-https gnupg
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+        apt-get update -y
+        apt-get install -y caddy
+    else
+        echo -e "   [OK] Caddy уже установлен на сервере."
+    fi
+
+    echo -e "${CYAN}⚙️ Создание конфигурации /etc/caddy/Caddyfile...${NC}"
+    if [ -f /etc/caddy/Caddyfile ]; then
+        cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)"
+    fi
+    mkdir -p /etc/caddy
+    cat << CADDY_CONF > /etc/caddy/Caddyfile
+# Автоматически сгенерировано скриптом install.sh
+${DOMAIN_NAME} {
+    reverse_proxy 127.0.0.1:8080
+}
+CADDY_CONF
+
+    # Открытие портов в файрволе UFW (если активен)
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${CYAN}🔓 Открытие портов 80 и 443 в UFW...${NC}"
+        ufw allow 80/tcp >/dev/null 2>&1 || true
+        ufw allow 443/tcp >/dev/null 2>&1 || true
+    fi
+
+    systemctl daemon-reload
+    systemctl enable caddy
+    systemctl restart caddy
+    echo -e "${GREEN}✅ Caddy успешно настроен и запущен! Домен ${DOMAIN_NAME} перенаправляет на 127.0.0.1:8080.${NC}"
+fi
+
+# 8. Развертывание виртуального окружения Python
 echo -e "\n${BLUE}🐍 Создание виртуального окружения Python...${NC}"
 rm -rf "${INSTALL_DIR}/venv"
 python3 -m venv "${INSTALL_DIR}/venv"
@@ -195,12 +258,12 @@ echo -e "${CYAN}📥 Установка Python-зависимостей из req
 "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip setuptools wheel
 "${INSTALL_DIR}/venv/bin/pip" install -r "${INSTALL_DIR}/requirements.txt"
 
-# 8. Каталоги для хранения данных
+# 9. Каталоги для хранения данных
 mkdir -p "${INSTALL_DIR}/data/web_downloads"
 mkdir -p "${INSTALL_DIR}/data/cache"
 chmod 755 "${INSTALL_DIR}/data"
 
-# 9. Создание конфигурационного файла .env
+# 10. Создание конфигурационного файла .env
 echo -e "\n${BLUE}📝 Создание файла конфигурации .env...${NC}"
 cat << ENV_CONFIG > "${INSTALL_DIR}/.env"
 # Сгенерировано автоматически скриптом install.sh ($(date))
@@ -225,7 +288,7 @@ ENV_CONFIG
 chmod 600 "${INSTALL_DIR}/.env"
 echo -e "${GREEN}✅ Файл .env успешно создан с защищенными правами (chmod 600).${NC}"
 
-# 10. Создание и регистрация systemd-сервиса
+# 11. Создание и регистрация systemd-сервиса
 SERVICE_FILE="/etc/systemd/system/mega-bot.service"
 echo -e "\n${BLUE}⚙️ Регистрация systemd-сервиса ${SERVICE_FILE}...${NC}"
 
@@ -258,7 +321,7 @@ systemctl restart mega-bot.service
 
 sleep 2
 
-# 11. Проверка статуса
+# 12. Проверка статуса
 echo -e "\n${CYAN}🔍 Проверка статуса запуска...${NC}"
 if systemctl is-active --quiet mega-bot.service; then
     echo -e "${GREEN}${BOLD}🎉 БОТ УСПЕШНО УСТАНОВЛЕН И ЗАПУЩЕН!${NC}"
@@ -269,10 +332,14 @@ else
 fi
 
 echo -e "\n${GREEN}====================================================================${NC}"
-echo -e "${GREEN}${BOLD}📋 ПОЛЕЗНЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ БОТОМ:${NC}"
-echo -e "  • Статус сервиса:        ${BOLD}systemctl status mega-bot${NC}"
-echo -e "  • Живой лог сообщений:   ${BOLD}journalctl -u mega-bot -f -n 50${NC}"
+echo -e "${GREEN}${BOLD}📋 ПОЛЕЗНЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ:${NC}"
+echo -e "  • Статус бота:           ${BOLD}systemctl status mega-bot${NC}"
+echo -e "  • Живые логи бота:       ${BOLD}journalctl -u mega-bot -f -n 50${NC}"
 echo -e "  • Перезапуск бота:       ${BOLD}systemctl restart mega-bot${NC}"
-echo -e "  • Остановка бота:        ${BOLD}systemctl stop mega-bot${NC}"
-echo -e "  • Конфигурация:          ${BOLD}nano ${INSTALL_DIR}/.env${NC}"
+if [ "$USE_CADDY" = true ]; then
+echo -e "  • Статус Caddy:          ${BOLD}systemctl status caddy${NC}"
+echo -e "  • Логи Caddy:            ${BOLD}journalctl -u caddy -f -n 50${NC}"
+echo -e "  • Конфиг Caddy:          ${BOLD}nano /etc/caddy/Caddyfile${NC}"
+fi
+echo -e "  • Конфигурация (.env):   ${BOLD}nano ${INSTALL_DIR}/.env${NC}"
 echo -e "${GREEN}====================================================================${NC}\n"
