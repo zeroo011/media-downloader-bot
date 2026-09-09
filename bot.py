@@ -102,6 +102,7 @@ class DownloadJob:
     track_name: str | None = None
     duration: float | None = None
     timeout: float | None = None
+    max_height: int | None = None
 
 def calculate_job_timeout(duration: float | None) -> float:
     """Рассчитывает динамический таймаут на основе длительности медиа."""
@@ -703,27 +704,41 @@ def check_unsupported_url(url: str) -> str | None:
 
 def parse_ytdlp_error(stderr_text: str) -> str:
     lower = stderr_text.lower()
-    if "sign in to confirm you're not a bot" in lower:
-        return "YouTube заблокировал запрос (проверка на бота). Требуется обновить cookies в боте."
-    if "private video" in lower or "this video is private" in lower:
-        return "Видео приватное (доступ только по персональному приглашению)."
-    if "video unavailable" in lower:
-        return "Видео недоступно (удалено автором или заблокировано в регионе)."
-    if "age-restricted" in lower or "confirm your age" in lower:
-        return "Видео имеет возрастное ограничение 18+. Требуются cookies аккаунта."
-    if "copyright" in lower or "blocked on copyright grounds" in lower:
-        return "Видео заблокировано правообладателем по авторским правам."
-    if "join this channel" in lower or "members-only" in lower:
-        return "Видео доступно только спонсорам канала."
-    if "reddit" in lower or "account authentication is required" in lower:
-        return "Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна."
-    if "duration" in lower and ("match-filter" in lower or "longer than" in lower or "too long" in lower):
-        return "Видео слишком длинное (лимит 45 минут), чтобы не перегружать сервер."
-    if "is live" in lower or "live stream" in lower:
-        return "Прямые трансляции (стримы) не поддерживаются."
-    if "max-filesize" in lower:
-        return f"Файл превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ)."
-    return f"Не удалось скачать. Видео приватное, превышен лимит {MAX_FILE_SIZE_MB} МБ или сервис временно недоступен."
+    # 1. Превышение размера файла
+    if any(k in lower for k in ["max-filesize", "too large", "larger than", "file is larger than", "filesize"]):
+        return f"⚠️ Файл слишком большой (превышает лимит {MAX_FILE_SIZE_MB} МБ)."
+    # 2. Приватное / 18+ видео / автор ограничил доступ / вход в аккаунт
+    if any(k in lower for k in [
+        "private video", "this video is private", "age-restricted", "confirm your age",
+        "sign in", "login required", "account required", "join this channel", "members-only",
+        "who has granted you access"
+    ]):
+        return "⚠️ Видео недоступно: автор ограничил доступ или требуется вход в аккаунт."
+    # 3. Удалено / Авторские права / Блокировка
+    if any(k in lower for k in [
+        "video unavailable", "this video has been removed", "removed by the user",
+        "copyright", "blocked on copyright grounds", "copyright claim",
+        "has been terminated", "is no longer available", "deleted"
+    ]):
+        return "⚠️ Видео удалено либо заблокировано правообладателем."
+    # 4. Ошибки сети / Таймауты / Серверные сбои источника
+    if any(k in lower for k in [
+        "timeout", "timed out", "connection reset", "network is unreachable",
+        "name or service not known", "temporary failure", "failed to connect",
+        "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+        "http error 502", "http error 503", "http error 504", "http error 429",
+        "too many requests", "unable to download webpage"
+    ]):
+        return "⚠️ Источник временно не отвечает или отдает поток слишком медленно. Попробуй позже."
+    # 5. Специфические сервисные ошибки
+    if any(k in lower for k in ["reddit", "account authentication is required"]):
+        return "⚠️ Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна."
+    if "duration" in lower and any(k in lower for k in ["match-filter", "longer than", "too long"]):
+        return "⚠️ Видео слишком длинное (лимит 45 минут), чтобы не перегружать сервер."
+    if any(k in lower for k in ["is live", "live stream"]):
+        return "⚠️ Прямые трансляции (стримы) не поддерживаются."
+    # 6. Общий дефолтный ответ
+    return "⚠️ Не удалось загрузить медиа. Сервис временно недоступен или ссылка недействительна."
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ПРОГРЕСС-БАРА И ВРЕМЕНИ СКАЧИВАНИЯ ---
 
@@ -1521,27 +1536,23 @@ async def process_download_job(job: DownloadJob):
 
                 if is_youtube and job.audio_format_id:
                     # Приоритет AVC/H.264 для мгновенной склейки без перекодирования!
+                    h = job.max_height or 1080
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height<=1080]+{job.audio_format_id}/"
-                        f"bestvideo[vcodec^=avc][height<=720]+{job.audio_format_id}/"
-                        f"bestvideo[vcodec^=avc]+{job.audio_format_id}/"
-                        f"bestvideo[height<=720]+{job.audio_format_id}/"
-                        f"bestvideo[height<=480]+{job.audio_format_id}/"
+                        f"bestvideo[vcodec^=avc][height<={h}]+{job.audio_format_id}/"
+                        f"bestvideo[height<={h}]+{job.audio_format_id}/"
+                        f"best[height<={h}]/"
                         f"bestvideo+{job.audio_format_id}/"
-                        f"best[height<=720]/"
                         "best"
                     )
                 elif is_youtube:
                     # YouTube видео без ручного выбора дорожки (одиночный трек)
+                    h = job.max_height or 1080
                     audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                     format_rule = (
-                        f"bestvideo[vcodec^=avc][height<=1080]+{audio_subrule}/"
-                        f"bestvideo[vcodec^=avc][height<=720]+{audio_subrule}/"
-                        f"bestvideo[vcodec^=avc]+{audio_subrule}/"
-                        f"bestvideo[height<=720]+{audio_subrule}/"
-                        f"bestvideo[height<=480]+{audio_subrule}/"
+                        f"bestvideo[vcodec^=avc][height<={h}]+{audio_subrule}/"
+                        f"bestvideo[height<={h}]+{audio_subrule}/"
+                        f"best[height<={h}]/"
                         f"bestvideo+{audio_subrule}/"
-                        f"best[height<=720]/"
                         "best"
                     )
                 else:
@@ -1680,7 +1691,7 @@ async def process_download_job(job: DownloadJob):
         if not valid_files:
             error_message = parse_ytdlp_error(last_ytdlp_error)
             try:
-                await job.status_msg.edit_text(f"⚠️ {error_message}")
+                await job.status_msg.edit_text(error_message)
             except Exception:
                 pass
             await increment_stat("failed")
@@ -1976,7 +1987,7 @@ async def process_download_job(job: DownloadJob):
                     )
                     await increment_stat("success")
                 else:
-                    await job.message.answer(f"⚠️ Аудиофайл ({file_size_mb} МБ) превышает лимит сервера 200 МБ.")
+                    await job.message.answer(f"⚠️ Аудиофайл ({file_size_mb} МБ) превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ).")
                     await increment_stat("failed")
 
         elif photos:
@@ -2357,118 +2368,224 @@ def _extract_youtube_info_sync(url: str) -> dict | None:
         logging.warning(f"_extract_youtube_info_sync error: {e}")
         return None
 
-async def get_youtube_audio_tracks(url: str) -> tuple[str, list[dict], dict | None, float | None]:
-    """Анализирует форматы YouTube. Если доступно несколько языковых аудиодорожек, возвращает (title, tracks, default_track, duration)."""
+def _estimate_format_size(f: dict, duration: float | None) -> int | None:
+    """Безопасно рассчитывает примерный размер формата в байтах."""
+    if not isinstance(f, dict):
+        return None
+    sz = f.get("filesize") or f.get("filesize_approx")
+    if sz and sz > 0:
+        return int(sz)
+    tbr = f.get("tbr") or f.get("vbr") or f.get("abr") or 0
+    try:
+        tbr_val = float(tbr)
+    except (ValueError, TypeError):
+        tbr_val = 0.0
+    if tbr_val > 0 and duration and duration > 0:
+        return int(tbr_val * 1024 / 8 * duration)
+    return None
+
+async def get_youtube_media_options(url: str) -> tuple[str, list[dict], dict | None, dict[int, float | None], float | None, bool]:
+    """
+    Анализирует метаданные YouTube без скачивания.
+    Возвращает (title, tracks, default_track, filtered_qualities, duration, has_oversize_only):
+    - tracks: список альтернативных дорожек (если доступно > 1)
+    - default_track: дорожка по умолчанию (оригинал)
+    - filtered_qualities: словарь {height: approx_total_mb} для разрешений <= MAX_FILE_SIZE_MB
+    - duration: длительность видео в секундах
+    - has_oversize_only: True, если форматы есть, но все превышают MAX_FILE_SIZE_MB
+    """
     try:
         info = await asyncio.to_thread(_extract_youtube_info_sync, url)
     except Exception as e:
-        logging.warning(f"Failed to get YouTube audio info: {e}")
-        return "", [], None, None
+        logging.warning(f"Failed to get YouTube media options: {e}")
+        return "", [], None, {}, None, False
 
     if not info:
-        return "", [], None, None
+        return "", [], None, {}, None, False
 
     title = info.get("title") or "YouTube Video"
     duration = info.get("duration")
     formats = info.get("formats", [])
+
+    # 1. Анализ аудиопотоков для оценки размера и выбора дорожек
     audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
-
-    if not audio_formats:
-        return title, [], None, duration
-
-    by_lang: dict[str, dict] = {}
+    audio_sizes = []
     for f in audio_formats:
-        lang = (f.get("language") or "").strip()
-        note = (f.get("format_note") or "").lower()
-        url_str = (f.get("url") or "").lower()
-
-        is_orig = (
-            f.get("language_preference", 0) > 0 or
-            "original" in note or
-            "acont=original" in url_str or
-            "original" in (f.get("format") or "").lower()
-        )
-        is_dub = "dubbed" in note or "acont=dubbed" in url_str or "- dubbed" in note
-
-        key = lang if lang else ("orig" if is_orig else "default")
-        abr = f.get("abr") or f.get("tbr") or 0
-        ext_score = 10 if f.get("ext") == "m4a" else 5
-        score = ext_score * 1000 + abr
-
-        curr = by_lang.get(key)
-        if not curr or score > curr["score"]:
-            by_lang[key] = {
-                "format_id": f.get("format_id"),
-                "language": lang,
-                "format_note": f.get("format_note", ""),
-                "is_original": is_orig or (curr["is_original"] if curr else False),
-                "is_dubbed": is_dub,
-                "score": score,
-                "ext": f.get("ext"),
-                "abr": abr
-            }
-        elif is_orig:
-            curr["is_original"] = True
-
-    # Если звуковая дорожка всего одна — интерактивное меню не требуется
-    if len(by_lang) <= 1:
-        return title, [], None, duration
+        sz = _estimate_format_size(f, duration)
+        if sz:
+            audio_sizes.append(sz)
+    best_audio_sz = max(audio_sizes) if audio_sizes else 0
 
     tracks: list[dict] = []
     default_track = None
 
-    for key, data in by_lang.items():
-        lang_code = data["language"] or key
-        if lang_code in LANG_NAMES:
-            flag, name = LANG_NAMES[lang_code]
+    if audio_formats:
+        by_lang: dict[str, dict] = {}
+        for f in audio_formats:
+            lang = (f.get("language") or "").strip()
+            note = (f.get("format_note") or "").lower()
+            url_str = (f.get("url") or "").lower()
+
+            is_orig = (
+                f.get("language_preference", 0) > 0 or
+                "original" in note or
+                "acont=original" in url_str or
+                "original" in (f.get("format") or "").lower()
+            )
+            is_dub = "dubbed" in note or "acont=dubbed" in url_str or "- dubbed" in note
+
+            key = lang if lang else ("orig" if is_orig else "default")
+            abr = f.get("abr") or f.get("tbr") or 0
+            ext_score = 10 if f.get("ext") == "m4a" else 5
+            score = ext_score * 1000 + abr
+
+            curr = by_lang.get(key)
+            if not curr or score > curr["score"]:
+                by_lang[key] = {
+                    "format_id": f.get("format_id"),
+                    "language": lang,
+                    "format_note": f.get("format_note", ""),
+                    "is_original": is_orig or (curr["is_original"] if curr else False),
+                    "is_dubbed": is_dub,
+                    "score": score,
+                    "ext": f.get("ext"),
+                    "abr": abr
+                }
+            elif is_orig:
+                curr["is_original"] = True
+
+        if len(by_lang) > 1:
+            for key, data in by_lang.items():
+                lang_code = data["language"] or key
+                if lang_code in LANG_NAMES:
+                    flag, name = LANG_NAMES[lang_code]
+                else:
+                    base_lang = lang_code.split("-")[0].lower()
+                    if base_lang in LANG_NAMES:
+                        flag, name = LANG_NAMES[base_lang]
+                    else:
+                        flag, name = "🌐", (lang_code.upper() if lang_code else "Аудио")
+
+                is_orig = data["is_original"]
+                label = f"{flag} {name} (Оригинал)" if is_orig else f"{flag} {name} (Дубляж)"
+
+                track_info = {
+                    "format_id": data["format_id"],
+                    "language": lang_code,
+                    "label": label,
+                    "is_original": is_orig,
+                    "ext": data["ext"]
+                }
+                tracks.append(track_info)
+                if is_orig and not default_track:
+                    default_track = track_info
+
+            if not default_track and tracks:
+                default_track = tracks[0]
+                default_track["is_original"] = True
+                lang_code = default_track["language"]
+                flag, name = LANG_NAMES.get(lang_code, ("🌐", lang_code.upper()))
+                default_track["label"] = f"{flag} {name} (Оригинал)"
+
+            def sort_key(t):
+                if t.get("is_original"):
+                    return (0, "")
+                lang = t.get("language", "").lower()
+                if lang.startswith("ru"):
+                    return (1, "")
+                if lang.startswith("en"):
+                    return (2, "")
+                return (3, t.get("label", ""))
+
+            tracks.sort(key=sort_key)
+
+    # 2. Анализ видеопотоков по целевым разрешениям [1080, 720, 480, 360]
+    raw_qualities: dict[int, float | None] = {}
+    for target_h in [1080, 720, 480, 360]:
+        candidates = [
+            f for f in formats
+            if f.get("vcodec") != "none"
+            and (f.get("height") == target_h or min(f.get("height") or 0, f.get("width") or 0) == target_h)
+            and not (f.get("protocol") or "").startswith("m3u8")
+        ]
+        if not candidates:
+            continue
+        avc_cands = [f for f in candidates if (f.get("vcodec") or "").startswith("avc")]
+        chosen = avc_cands[0] if avc_cands else candidates[0]
+        v_size = _estimate_format_size(chosen, duration)
+        if v_size is not None:
+            total_mb = round((v_size + best_audio_sz) / (1024 * 1024), 1)
         else:
-            base_lang = lang_code.split("-")[0].lower()
-            if base_lang in LANG_NAMES:
-                flag, name = LANG_NAMES[base_lang]
+            total_mb = None
+        raw_qualities[target_h] = total_mb
+
+    filtered_qualities: dict[int, float | None] = {}
+    oversize_count = 0
+    for h, sz in raw_qualities.items():
+        if sz is not None:
+            if sz <= MAX_FILE_SIZE_MB:
+                filtered_qualities[h] = sz
             else:
-                flag, name = "🌐", (lang_code.upper() if lang_code else "Аудио")
+                oversize_count += 1
+        else:
+            filtered_qualities[h] = None
 
-        is_orig = data["is_original"]
-        label = f"{flag} {name} (Оригинал)" if is_orig else f"{flag} {name} (Дубляж)"
+    has_oversize_only = (len(raw_qualities) > 0 and len(filtered_qualities) == 0 and oversize_count > 0)
 
-        track_info = {
-            "format_id": data["format_id"],
-            "language": lang_code,
-            "label": label,
-            "is_original": is_orig,
-            "ext": data["ext"]
-        }
-        tracks.append(track_info)
-        if is_orig and not default_track:
-            default_track = track_info
+    return title, tracks, default_track, filtered_qualities, duration, has_oversize_only
 
-    if not default_track and tracks:
-        default_track = tracks[0]
-        default_track["is_original"] = True
-        lang_code = default_track["language"]
-        flag, name = LANG_NAMES.get(lang_code, ("🌐", lang_code.upper()))
-        default_track["label"] = f"{flag} {name} (Оригинал)"
+def format_quality_label(height: int, size_mb: float | None) -> str:
+    """Форматирует текст кнопки качества с иконкой и весом."""
+    icons = {1080: "🌟", 720: "🎬", 480: "📱", 360: "📺"}
+    icon = icons.get(height, "📹")
+    if size_mb is not None:
+        return f"{icon} {height}p (~{size_mb} МБ)"
+    return f"{icon} {height}p"
 
-    def sort_key(t):
-        if t.get("is_original"):
-            return (0, "")
-        lang = t.get("language", "").lower()
-        if lang.startswith("ru"):
-            return (1, "")
-        if lang.startswith("en"):
-            return (2, "")
-        return (3, t.get("label", ""))
+def build_youtube_quality_keyboard(session_id: str, qualities: dict[int, float | None]) -> InlineKeyboardMarkup:
+    """Генерирует инлайн-клавиатуру выбора качества видео."""
+    rows = []
+    sorted_heights = sorted(qualities.keys(), reverse=True)
+    if not sorted_heights:
+        return InlineKeyboardMarkup(inline_keyboard=[])
 
-    tracks.sort(key=sort_key)
-    return title, tracks, default_track, duration
+    if 1080 in sorted_heights:
+        rows.append([InlineKeyboardButton(
+            text=format_quality_label(1080, qualities[1080]),
+            callback_data=f"ytqual:{session_id}:1080"
+        )])
+        remaining = [h for h in sorted_heights if h != 1080]
+    else:
+        remaining = sorted_heights
+
+    pair = []
+    for h in remaining:
+        pair.append(InlineKeyboardButton(
+            text=format_quality_label(h, qualities[h]),
+            callback_data=f"ytqual:{session_id}:{h}"
+        ))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    best_h = max(sorted_heights)
+    best_sz = qualities[best_h]
+    best_text = f"⚡ Скачать лучшее (~{best_sz} МБ)" if best_sz is not None else "⚡ Скачать лучшее"
+    rows.append([InlineKeyboardButton(
+        text=best_text,
+        callback_data=f"ytqual:{session_id}:best"
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def build_youtube_audio_keyboard(session_id: str, tracks: list[dict]) -> InlineKeyboardMarkup:
+    """Генерирует инлайн-клавиатуру выбора звуковой дорожки (Шаг 1)."""
     rows = []
     if len(tracks) <= 4:
         for idx, tr in enumerate(tracks):
             rows.append([InlineKeyboardButton(text=tr["label"], callback_data=f"ytaudio:{session_id}:{idx}")])
     else:
-        # Оригинальная дорожка во всю ширину первой кнопкой
         rows.append([InlineKeyboardButton(text=tracks[0]["label"], callback_data=f"ytaudio:{session_id}:0")])
         pair = []
         for idx in range(1, len(tracks)):
@@ -2480,28 +2597,39 @@ def build_youtube_audio_keyboard(session_id: str, tracks: list[dict]) -> InlineK
         if pair:
             rows.append(pair)
 
-    rows.append([InlineKeyboardButton(text="⚡ Скачать оригинал (по умолчанию)", callback_data=f"ytaudio:{session_id}:orig")])
+    rows.append([InlineKeyboardButton(text="⚡ Скачать всё по умолчанию", callback_data=f"ytaudio:{session_id}:quick_orig")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def handle_youtube_audio_timeout(session_id: str, delay: int = 90):
-    """Таймаут ожидания выбора аудиодорожки (по умолчанию 90 сек). Удаляет сессию через .pop()."""
+async def handle_youtube_session_timeout(session_id: str, delay: int = 60):
+    """Таймаут ожидания выбора дорожки/качества видео. Удаляет сессию через .pop()."""
     await asyncio.sleep(delay)
     session = YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
     if not session:
         return
 
     tracks = session.get("tracks", [])
-    default_track = session.get("default_track") or (tracks[0] if tracks else None)
-    if not default_track:
-        return
+    chosen_track = session.get("chosen_track")
+    if not chosen_track:
+        chosen_track = session.get("default_track") or (tracks[0] if tracks else None)
+
+    qualities = session.get("qualities", {})
+    best_height = max(qualities.keys()) if qualities else None
 
     status_msg = session["status_msg"]
     title = session.get("title", "Видео")
-    label = default_track.get("label", "Оригинал")
+    audio_label = chosen_track.get("label") if chosen_track else None
+
+    timeout_details = []
+    if audio_label and len(tracks) > 1:
+        timeout_details.append(f"звук: {audio_label}")
+    if best_height and session.get("mode") != "audio":
+        timeout_details.append(f"качество: {best_height}p")
+    detail_str = f" ({', '.join(timeout_details)})" if timeout_details else ""
+
     try:
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(title)}</b>\n\n"
-            f"⏱ <i>Время выбора истекло (1.5 мин). Выбрана оригинальная дорожка:</i> <b>{label}</b>\n"
+            f"⏱ <i>Время выбора истекло. Автовыбор{detail_str}.</i>\n"
             f"⏳ Начинаю загрузку...",
             reply_markup=None
         )
@@ -2513,24 +2641,24 @@ async def handle_youtube_audio_timeout(session_id: str, delay: int = 90):
         url=session["url"],
         mode=session["mode"],
         status_msg=status_msg,
-        audio_format_id=default_track.get("format_id"),
-        track_name=label,
-        duration=session.get("duration")
+        audio_format_id=chosen_track.get("format_id") if chosen_track else None,
+        track_name=audio_label,
+        duration=session.get("duration"),
+        max_height=best_height if session.get("mode") != "audio" else None
     )
 
 @dp.callback_query(F.data.startswith("ytaudio:"))
 async def youtube_audio_callback(callback: CallbackQuery):
-    """Обработка выбора пользователем аудиодорожки для YouTube."""
+    """Обработка выбора пользователем аудиодорожки для YouTube (Шаг 1)."""
     data = callback.data.split(":")
     if len(data) != 3:
         await callback.answer("Ошибка запроса.", show_alert=True)
         return
     _, session_id, choice = data
 
-    # Удаление сессии через .pop() для защиты памяти
-    session = YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+    session = YOUTUBE_AUDIO_SESSIONS.get(session_id)
     if not session:
-        await callback.answer("⏳ Время выбора дорожки истекло или выбор уже сделан.", show_alert=True)
+        await callback.answer("⏳ Время выбора истекло или выбор уже сделан.", show_alert=True)
         return
 
     timeout_task = session.get("timeout_task")
@@ -2539,6 +2667,39 @@ async def youtube_audio_callback(callback: CallbackQuery):
 
     tracks = session.get("tracks", [])
     default_track = session.get("default_track") or (tracks[0] if tracks else None)
+
+    if choice == "quick_orig":
+        YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+        chosen_track = default_track
+        label = chosen_track.get("label", "Оригинал") if chosen_track else "Оригинал"
+        qualities = session.get("qualities", {})
+        best_height = max(qualities.keys()) if qualities else None
+
+        await callback.answer("Скачиваю оригинал в лучшем качестве...")
+        status_msg = session["status_msg"]
+        title = session.get("title", "Видео")
+        try:
+            await status_msg.edit_text(
+                f"🎬 <b>{html.escape(title)}</b>\n\n"
+                f"🔊 Озвучка: <b>{label}</b>\n"
+                f"📹 Качество: <b>{best_height}p</b>\n"
+                f"⏳ Начинаю загрузку...",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        await enqueue_job(
+            message=session["message"],
+            url=session["url"],
+            mode=session["mode"],
+            status_msg=status_msg,
+            audio_format_id=chosen_track.get("format_id") if chosen_track else None,
+            track_name=label,
+            duration=session.get("duration"),
+            max_height=best_height
+        )
+        return
 
     if choice == "orig":
         chosen_track = default_track
@@ -2555,12 +2716,114 @@ async def youtube_audio_callback(callback: CallbackQuery):
     label = chosen_track.get("label", "Оригинал")
     await callback.answer(f"Выбрана дорожка: {label}")
 
+    # Если режим audio — сразу запускаем скачивание аудио без шага качества
+    if session.get("mode") == "audio":
+        YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+        status_msg = session["status_msg"]
+        title = session.get("title", "Видео")
+        try:
+            await status_msg.edit_text(
+                f"🎬 <b>{html.escape(title)}</b>\n\n"
+                f"🔊 Озвучка: <b>{label}</b>\n"
+                f"⏳ Начинаю загрузку аудио...",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+        await enqueue_job(
+            message=session["message"],
+            url=session["url"],
+            mode="audio",
+            status_msg=status_msg,
+            audio_format_id=chosen_track.get("format_id"),
+            track_name=label,
+            duration=session.get("duration")
+        )
+        return
+
+    # Переход к Шагу 2: Выбор качества видео!
+    session["chosen_track"] = chosen_track
+    session["step"] = "quality"
+    session["created_at"] = time.time()  # Сброс таймера (Нюанс 3)
+    new_timer = asyncio.create_task(handle_youtube_session_timeout(session_id, 60))
+    session["timeout_task"] = new_timer
+
+    qualities = session.get("qualities", {})
+    if not qualities:
+        YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+        new_timer.cancel()
+        await enqueue_job(
+            message=session["message"],
+            url=session["url"],
+            mode=session["mode"],
+            status_msg=session["status_msg"],
+            audio_format_id=chosen_track.get("format_id"),
+            track_name=label,
+            duration=session.get("duration")
+        )
+        return
+
+    kb = build_youtube_quality_keyboard(session_id, qualities)
     status_msg = session["status_msg"]
     title = session.get("title", "Видео")
     try:
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(title)}</b>\n\n"
             f"🔊 Озвучка: <b>{label}</b>\n"
+            f"📹 <b>Шаг 2 из 2: Выбери качество видео:</b>\n\n"
+            f"<i>⏳ Автовыбор лучшего через 1 мин.</i>",
+            reply_markup=kb
+        )
+    except Exception as e:
+        logging.warning(f"Failed to show quality menu in step 2: {e}")
+
+@dp.callback_query(F.data.startswith("ytqual:"))
+async def youtube_quality_callback(callback: CallbackQuery):
+    """Обработка выбора пользователем качества видео (Шаг 2 или одиночный шаг)."""
+    data = callback.data.split(":")
+    if len(data) != 3:
+        await callback.answer("Ошибка запроса.", show_alert=True)
+        return
+    _, session_id, choice = data
+
+    session = YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+    if not session:
+        await callback.answer("⏳ Время выбора качества истекло или выбор уже сделан.", show_alert=True)
+        return
+
+    timeout_task = session.get("timeout_task")
+    if timeout_task and not timeout_task.done():
+        timeout_task.cancel()
+
+    qualities = session.get("qualities", {})
+    if choice == "best":
+        chosen_height = max(qualities.keys()) if qualities else None
+    else:
+        try:
+            chosen_height = int(choice)
+        except ValueError:
+            chosen_height = max(qualities.keys()) if qualities else None
+
+    label_q = f"{chosen_height}p" if chosen_height else "Лучшее"
+    await callback.answer(f"Выбрано качество: {label_q}")
+
+    chosen_track = session.get("chosen_track") or session.get("default_track")
+    audio_label = chosen_track.get("label") if chosen_track else None
+    audio_format_id = chosen_track.get("format_id") if chosen_track else None
+
+    status_msg = session["status_msg"]
+    title = session.get("title", "Видео")
+
+    details = []
+    if audio_label and len(session.get("tracks", [])) > 1:
+        details.append(f"🔊 Озвучка: <b>{audio_label}</b>")
+    details.append(f"📹 Качество: <b>{label_q}</b>")
+    details_str = "\n".join(details)
+
+    try:
+        await status_msg.edit_text(
+            f"🎬 <b>{html.escape(title)}</b>\n\n"
+            f"{details_str}\n"
             f"⏳ Начинаю загрузку...",
             reply_markup=None
         )
@@ -2572,9 +2835,10 @@ async def youtube_audio_callback(callback: CallbackQuery):
         url=session["url"],
         mode=session["mode"],
         status_msg=status_msg,
-        audio_format_id=chosen_track.get("format_id"),
-        track_name=label,
-        duration=session.get("duration")
+        audio_format_id=audio_format_id,
+        track_name=audio_label,
+        duration=session.get("duration"),
+        max_height=chosen_height
     )
 
 # --- ОЧЕРЕДЬ И ВАЛИДАЦИЯ ---
@@ -2586,7 +2850,8 @@ async def enqueue_job(
     status_msg: Message | None = None,
     audio_format_id: str | None = None,
     track_name: str | None = None,
-    duration: float | None = None
+    duration: float | None = None,
+    max_height: int | None = None
 ):
     user_id = message.from_user.id
     current_queue_len = len(QUEUE_JOBS)
@@ -2633,7 +2898,8 @@ async def enqueue_job(
             audio_format_id=audio_format_id,
             track_name=track_name,
             duration=duration,
-            timeout=calculate_job_timeout(duration)
+            timeout=calculate_job_timeout(duration),
+            max_height=max_height
         )
         QUEUE_JOBS.append(job)
         await DOWNLOAD_QUEUE.put(job)
@@ -2678,7 +2944,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
 
     is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
 
-    # Для YouTube проверяем наличие нескольких аудиодорожек (Multi-Audio Tracks) и длительность
+    # Для YouTube анализируем форматы, звуковые дорожки, качества и длительность
     if is_youtube:
         try:
             status_msg = await message.answer("🔍 Анализирую ссылку YouTube...")
@@ -2688,10 +2954,10 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
             return
 
         try:
-            title, tracks, default_track, duration = await get_youtube_audio_tracks(url)
+            title, tracks, default_track, qualities, duration, has_oversize_only = await get_youtube_media_options(url)
         except Exception as e:
-            logging.warning(f"Error checking YouTube audio tracks: {e}")
-            title, tracks, default_track, duration = "", [], None, None
+            logging.warning(f"Error checking YouTube media options: {e}")
+            title, tracks, default_track, qualities, duration, has_oversize_only = "", [], None, {}, None, False
 
         # Проверка длительности: лимит 45 минут
         if duration and duration > 2700:
@@ -2703,6 +2969,65 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
             USER_ACTIVE_TIMESTAMP.pop(user_id, None)
             return
 
+        # Если все доступные качества превышают лимит сервера (MAX_FILE_SIZE_MB)
+        if mode not in ("audio", "round") and has_oversize_only:
+            try:
+                await status_msg.edit_text(
+                    f"⚠️ Видео слишком большое даже в минимальном качестве (превышает лимит {MAX_FILE_SIZE_MB} МБ). Я не смогу его обработать."
+                )
+            except Exception:
+                pass
+            USER_ACTIVE_COUNT[user_id] = max(0, USER_ACTIVE_COUNT.get(user_id, 1) - 1)
+            USER_ACTIVE_TIMESTAMP.pop(user_id, None)
+            return
+
+        # Режим audio (Извлечь MP3)
+        if mode == "audio":
+            if len(tracks) > 1:
+                session_id = uuid.uuid4().hex[:8]
+                YOUTUBE_AUDIO_SESSIONS[session_id] = {
+                    "url": url,
+                    "user_id": user_id,
+                    "message": message,
+                    "status_msg": status_msg,
+                    "mode": mode,
+                    "title": title,
+                    "tracks": tracks,
+                    "default_track": default_track,
+                    "qualities": {},
+                    "duration": duration,
+                    "chosen_track": None,
+                    "step": "audio",
+                    "created_at": time.time(),
+                    "timeout_task": None
+                }
+                kb = build_youtube_audio_keyboard(session_id, tracks)
+                timeout_task = asyncio.create_task(handle_youtube_session_timeout(session_id, 90))
+                YOUTUBE_AUDIO_SESSIONS[session_id]["timeout_task"] = timeout_task
+                try:
+                    await status_msg.edit_text(
+                        f"🎬 <b>{html.escape(title)}</b>\n\n"
+                        f"🔊 <b>Найдено несколько звуковых дорожек.</b>\n"
+                        f"Выбери желаемый язык озвучки:\n\n"
+                        f"<i>⏳ Автовыбор оригинала через 1.5 мин.</i>",
+                        reply_markup=kb
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to show audio selection menu: {e}")
+                    YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+                    await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
+                return
+            else:
+                await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
+                return
+
+        # Режим round (кружочек)
+        if mode == "round":
+            await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
+            return
+
+        # Стандартное скачивание видео (mode == "auto"):
+        # Вариант 1: Несколько аудиодорожек (Шаг 1 -> Шаг 2)
         if len(tracks) > 1:
             session_id = uuid.uuid4().hex[:8]
             YOUTUBE_AUDIO_SESSIONS[session_id] = {
@@ -2714,18 +3039,21 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                 "title": title,
                 "tracks": tracks,
                 "default_track": default_track,
+                "qualities": qualities,
                 "duration": duration,
+                "chosen_track": None,
+                "step": "audio",
                 "created_at": time.time(),
                 "timeout_task": None
             }
             kb = build_youtube_audio_keyboard(session_id, tracks)
-            timeout_task = asyncio.create_task(handle_youtube_audio_timeout(session_id, 90))
+            timeout_task = asyncio.create_task(handle_youtube_session_timeout(session_id, 90))
             YOUTUBE_AUDIO_SESSIONS[session_id]["timeout_task"] = timeout_task
 
             try:
                 await status_msg.edit_text(
                     f"🎬 <b>{html.escape(title)}</b>\n\n"
-                    f"🔊 <b>Найдено несколько звуковых дорожек.</b>\n"
+                    f"🔊 <b>Шаг 1 из 2: Найдено несколько звуковых дорожек.</b>\n"
                     f"Выбери желаемый язык озвучки:\n\n"
                     f"<i>⏳ Автовыбор оригинала через 1.5 мин.</i>",
                     reply_markup=kb
@@ -2736,8 +3064,45 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                 await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
             return
 
-        # Если дорожка всего одна (или ошибка анализа) — сразу запускаем стандартное скачивание
-        await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
+        # Вариант 2: Одна звуковая дорожка, есть выбор качеств
+        if len(qualities) > 1:
+            session_id = uuid.uuid4().hex[:8]
+            YOUTUBE_AUDIO_SESSIONS[session_id] = {
+                "url": url,
+                "user_id": user_id,
+                "message": message,
+                "status_msg": status_msg,
+                "mode": mode,
+                "title": title,
+                "tracks": tracks,
+                "default_track": default_track,
+                "qualities": qualities,
+                "duration": duration,
+                "chosen_track": default_track,
+                "step": "quality",
+                "created_at": time.time(),
+                "timeout_task": None
+            }
+            kb = build_youtube_quality_keyboard(session_id, qualities)
+            timeout_task = asyncio.create_task(handle_youtube_session_timeout(session_id, 60))
+            YOUTUBE_AUDIO_SESSIONS[session_id]["timeout_task"] = timeout_task
+
+            try:
+                await status_msg.edit_text(
+                    f"🎬 <b>{html.escape(title)}</b>\n\n"
+                    f"📹 <b>Выбери качество видео:</b>\n\n"
+                    f"<i>⏳ Автовыбор лучшего качества через 1 мин.</i>",
+                    reply_markup=kb
+                )
+            except Exception as e:
+                logging.warning(f"Failed to show quality menu: {e}")
+                YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
+                await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
+            return
+
+        # Вариант 3: Одно качество или без выбора — сразу скачиваем
+        best_h = max(qualities.keys()) if qualities else None
+        await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration, max_height=best_h)
         return
 
     # Для всех остальных сервисов (TikTok, Reels, VK, Reddit и др.) — стандартная отправка в очередь
@@ -2765,7 +3130,7 @@ async def start_handler(message: Message, state: FSMContext):
         "• <code>/audio ссылка</code> — скачать только MP3 аудио\n"
         "• <code>/round ссылка</code> — видеосообщение в виде кружочка\n"
         "• <code>/help</code> — список поддерживаемых площадок\n\n"
-        "📊 Видео до 50 МБ отправляются в чат, от 50 до 200 МБ — по защищённой ссылке HTTPS."
+        f"📊 Видео до 50 МБ отправляются в чат, от 50 до {MAX_FILE_SIZE_MB} МБ — по защищённой ссылке HTTPS."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -2792,7 +3157,7 @@ async def help_command(message: Message):
         "💡 <b>Полезные фичи:</b>\n"
         "• Для фото и видео доступна кнопка: <b>«📁 Файлом (без сжатия)»</b> — отправка оригинального файла как документ без потери качества Telegram.\n"
         "• Под видео доступны кнопки: <b>«🎵 Извлечь MP3»</b>, <b>«⭕ В кружочек»</b> и <b>«🖼 Обложка»</b>.\n"
-        "• Тяжелые файлы (до 200 МБ) отдаются по ссылке с нашего защищенного домена HTTPS."
+        f"• Тяжелые файлы (до {MAX_FILE_SIZE_MB} МБ) отдаются по ссылке с нашего защищенного домена HTTPS."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 

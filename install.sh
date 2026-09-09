@@ -100,8 +100,8 @@ else
     REC_PROFILE=1; REC_TEXT="Low"
 fi
 
-echo "  1) Low    (1 vCPU, 1-2 ГБ RAM) — 1 воркер, 1 поток FFmpeg, лимит 100 МБ"
-echo "  2) Medium (2-4 vCPU, 4 ГБ RAM) — 2 воркера, 2 потока FFmpeg, лимит 200 МБ"
+echo "  1) Low    (от 1 vCPU, 2 ГБ RAM, от 10 ГБ диск) — 1 воркер, 1 поток FFmpeg, лимит 250 МБ"
+echo "  2) Medium (2-4 vCPU, 4 ГБ RAM) — 2 воркера, 2 потока FFmpeg, лимит 350 МБ"
 echo "  3) High   (4+ vCPU, 8+ ГБ RAM) — 4 воркера, 4 потока FFmpeg, лимит 500 МБ"
 echo "  4) Автоматический выбор [Рекомендуется: ${REC_TEXT}]"
 
@@ -109,16 +109,16 @@ read -r -p "Выберите профиль [1-4, по умолчанию 4]: " 
 PROFILE_CHOICE=${PROFILE_CHOICE:-4}
 
 case "$PROFILE_CHOICE" in
-    1) NUM_WORKERS=1; FFMPEG_THREADS=1; MAX_FILE_SIZE_MB=100; MIN_FREE_DISK_GB=1.5; SELECTED_PROFILE="Low" ;;
-    2) NUM_WORKERS=2; FFMPEG_THREADS=2; MAX_FILE_SIZE_MB=200; MIN_FREE_DISK_GB=2.0; SELECTED_PROFILE="Medium" ;;
+    1) NUM_WORKERS=1; FFMPEG_THREADS=1; MAX_FILE_SIZE_MB=250; MIN_FREE_DISK_GB=2.0; SELECTED_PROFILE="Low" ;;
+    2) NUM_WORKERS=2; FFMPEG_THREADS=2; MAX_FILE_SIZE_MB=350; MIN_FREE_DISK_GB=3.0; SELECTED_PROFILE="Medium" ;;
     3) NUM_WORKERS=4; FFMPEG_THREADS=4; MAX_FILE_SIZE_MB=500; MIN_FREE_DISK_GB=4.0; SELECTED_PROFILE="High" ;;
     *)
         if [ "$REC_PROFILE" -eq 3 ]; then
             NUM_WORKERS=4; FFMPEG_THREADS=4; MAX_FILE_SIZE_MB=500; MIN_FREE_DISK_GB=4.0; SELECTED_PROFILE="High"
         elif [ "$REC_PROFILE" -eq 2 ]; then
-            NUM_WORKERS=2; FFMPEG_THREADS=2; MAX_FILE_SIZE_MB=200; MIN_FREE_DISK_GB=2.0; SELECTED_PROFILE="Medium"
+            NUM_WORKERS=2; FFMPEG_THREADS=2; MAX_FILE_SIZE_MB=350; MIN_FREE_DISK_GB=3.0; SELECTED_PROFILE="Medium"
         else
-            NUM_WORKERS=1; FFMPEG_THREADS=1; MAX_FILE_SIZE_MB=100; MIN_FREE_DISK_GB=1.5; SELECTED_PROFILE="Low"
+            NUM_WORKERS=1; FFMPEG_THREADS=1; MAX_FILE_SIZE_MB=250; MIN_FREE_DISK_GB=2.0; SELECTED_PROFILE="Low"
         fi
         ;;
 esac
