@@ -1,0 +1,65 @@
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+cookies.txt
+
+# Databases and persistence
+*.db
+*.sqlite
+*.sqlite3
+data/
+users.db
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Temporary media, cache and downloads
+web_downloads/
+cache/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.mp3
+*.m4a
+*.wav
+*.ogg
+*.opus
+*.flac
+*.part
+*.ytdl
+*.temp
+
+# Server logs and runtime dumps
+*.log
+*.pid
+
+# Backups and editor artifacts
+*.bak
+*.bak*
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Caddy & Docker data
+caddy_data/
+caddy_config/
