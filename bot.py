@@ -1523,7 +1523,7 @@ async def process_download_job(job: DownloadJob):
                     "--socket-timeout", "30",
                     "--retries", "10",
                     "--fragment-retries", "10",
-                    "--buffersize", "1024K",
+                    "--buffer-size", "1024K",
                     "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
                 if job.audio_format_id:
@@ -1589,7 +1589,7 @@ async def process_download_job(job: DownloadJob):
                     "--socket-timeout", "30",
                     "--retries", "10",
                     "--fragment-retries", "10",
-                    "--buffersize", "1024K",
+                    "--buffer-size", "1024K",
                     "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
                 if not is_youtube:
@@ -3529,7 +3529,7 @@ async def download_for_inline(url: str) -> dict | None:
                 "--socket-timeout", "30",
                 "--retries", "10",
                 "--fragment-retries", "10",
-                "--buffersize", "1024K",
+                "--buffer-size", "1024K",
                 "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}",
                 url
             ]
