@@ -100,6 +100,23 @@ class DownloadJob:
     is_active: bool = False
     audio_format_id: str | None = None
     track_name: str | None = None
+    duration: float | None = None
+    timeout: float | None = None
+
+def calculate_job_timeout(duration: float | None) -> float:
+    """Рассчитывает динамический таймаут на основе длительности медиа."""
+    if not duration or duration <= 0:
+        return 180.0
+    if duration <= 300:        # До 5 минут: 180 сек (3 мин)
+        return 180.0
+    elif duration <= 1200:     # От 5 до 20 минут: 420 сек (7 мин)
+        return 420.0
+    elif duration <= 2400:     # От 20 до 40 минут: 600 сек (10 мин)
+        return 600.0
+    elif duration <= 2700:     # От 40 до 45 минут: 660 сек (11 мин)
+        return 660.0
+    else:
+        return 180.0
 
 class Support(StatesGroup):
     waiting_for_message = State()
@@ -614,6 +631,20 @@ async def cleanup_worker():
                         USER_ACTIVE_TIMESTAMP.pop(uid, None)
                     YOUTUBE_AUDIO_SESSIONS.pop(sid, None)
 
+            # 8. Очистка завершенных или зависших фоновых задач инлайна
+            for u, t in list(INLINE_ACTIVE_TASKS.items()):
+                if t.done():
+                    INLINE_ACTIVE_TASKS.pop(u, None)
+
+            # 9. Удаление недокачанных .part, .ytdl и .temp файлов старше 2 минут
+            for tmp_pat in ("/tmp/*.part", "/tmp/*.ytdl", "/tmp/*.temp", f"{DATA_DIR}/*.part", f"{DATA_DIR}/*.ytdl"):
+                for leftover in glob.glob(tmp_pat):
+                    try:
+                        if os.path.isfile(leftover) and (now - os.path.getmtime(leftover) > 120):
+                            os.remove(leftover)
+                    except OSError:
+                        pass
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -686,6 +717,10 @@ def parse_ytdlp_error(stderr_text: str) -> str:
         return "Видео доступно только спонсорам канала."
     if "reddit" in lower or "account authentication is required" in lower:
         return "Сервис Reddit заблокировал доступ со стороны серверов (HTTP 403 Forbidden). Загрузка с Reddit временно недоступна."
+    if "duration" in lower and ("match-filter" in lower or "longer than" in lower or "too long" in lower):
+        return "Видео слишком длинное (лимит 45 минут), чтобы не перегружать сервер."
+    if "is live" in lower or "live stream" in lower:
+        return "Прямые трансляции (стримы) не поддерживаются."
     if "max-filesize" in lower:
         return f"Файл превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ)."
     return f"Не удалось скачать. Видео приватное, превышен лимит {MAX_FILE_SIZE_MB} МБ или сервис временно недоступен."
@@ -772,8 +807,8 @@ async def get_video_codec(filepath: str) -> str:
         logging.warning(f"Failed to get video codec for {filepath}: {e}")
         return ""
 
-async def ensure_h264(filepath: str, status_msg: Message | None = None) -> str:
-    """Проверяет кодек видео. Если не H.264 (например, VP9/AV1), быстро перекодирует в H.264 (-c:a copy) для предотвращения черного экрана на смартфонах. Возвращает итоговый путь к файлу."""
+async def ensure_h264(filepath: str, status_msg: Message | None = None, timeout: float = 300.0) -> str:
+    """Проверяет кодек видео. Если не H.264 (например, VP9/AV1), перекодирует в H.264 (-c:a copy) с пресетом ultrafast. Если уже H.264, делает быстрое копирование (-c copy) при необходимости. Возвращает итоговый путь к файлу."""
     if not os.path.exists(filepath):
         return filepath
     codec = await get_video_codec(filepath)
@@ -782,26 +817,63 @@ async def ensure_h264(filepath: str, status_msg: Message | None = None) -> str:
     if codec == "h264" and ext == ".mp4":
         return filepath
 
-    logging.info(f"Видео {filepath} (кодек '{codec}', ext '{ext}') требует оптимизации в H.264 MP4...")
+    dest_mp4 = os.path.splitext(filepath)[0] + "_h264.mp4"
+
+    # Если видеопоток уже H.264, но в другом контейнере (mkv/webm) -> чистое копирование потоков (-c copy) без нагрузки на CPU
+    if codec == "h264":
+        logging.info(f"Видео {filepath} уже имеет кодек H.264. Выполняю быстрое ремуксирование в MP4 (-c copy)...")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", filepath,
+            "-c", "copy",
+            dest_mp4,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            preexec_fn=os.setsid
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=60.0)
+            if proc.returncode == 0 and os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 0:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                return dest_mp4
+        except Exception as e:
+            logging.warning(f"Ошибка быстрого копирования H.264: {e}")
+            if proc and proc.returncode is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    await proc.wait()
+                except Exception:
+                    pass
+            if os.path.exists(dest_mp4):
+                try:
+                    os.remove(dest_mp4)
+                except OSError:
+                    pass
+            return filepath
+
+    # Если видеопоток НЕ H.264 (например, AV1 или VP9) -> быстрое перекодирование с ограничением разрешения и потоков
+    logging.info(f"Видео {filepath} (кодек '{codec}') требует оптимизации в H.264...")
     if status_msg:
         try:
-            await status_msg.edit_text("⚙️ Оптимизирую видео для Telegram (H.264)...")
+            await status_msg.edit_text("⚙️ <b>Склеиваю видео (это займет 1-2 мин)...</b>", parse_mode="HTML")
         except Exception:
             pass
 
-    dest_mp4 = os.path.splitext(filepath)[0] + "_h264.mp4"
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-i", filepath,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
         "-c:a", "copy",
-        "-threads", str(FFMPEG_THREADS),
+        "-threads", "2",
         dest_mp4,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
         preexec_fn=os.setsid
     )
     try:
-        await proc.wait()
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
         if proc.returncode == 0 and os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 0:
             if filepath != dest_mp4 and os.path.exists(filepath):
                 try:
@@ -819,6 +891,12 @@ async def ensure_h264(filepath: str, status_msg: Message | None = None) -> str:
             return filepath
     except Exception as e:
         logging.warning(f"Ошибка перекодирования H.264: {e}")
+        if proc and proc.returncode is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                await proc.wait()
+            except Exception:
+                pass
         if os.path.exists(dest_mp4):
             try:
                 os.remove(dest_mp4)
@@ -1360,8 +1438,16 @@ async def process_download_job(job: DownloadJob):
     proc = None
 
     try:
+        url = job.url
+        is_youtube = "youtube.com" in url or "youtu.be" in url
+        is_tiktok = any(d in url for d in ["tiktok.com", "douyin.com"])
+        downloaded = False
+        last_ytdlp_error = ""
+
         try:
-            if job.mode == "audio":
+            if is_youtube:
+                status_text = "⏳ Скачиваю видео и дорожку..."
+            elif job.mode == "audio":
                 status_text = "🎵 Извлекаю аудиодорожку..."
             elif job.mode == "round":
                 status_text = "⭕ Скачиваю и конвертирую в кружочек..."
@@ -1370,11 +1456,6 @@ async def process_download_job(job: DownloadJob):
             await job.status_msg.edit_text(status_text)
         except Exception:
             pass
-
-        url = job.url
-        is_tiktok = any(d in url for d in ["tiktok.com", "douyin.com"])
-        downloaded = False
-        last_ytdlp_error = ""
 
         # 1. Заглушка для Reddit (HTTP 403 Forbidden со стороны серверов)
         if any(d in url.lower() for d in ["reddit.com", "redd.it"]):
@@ -1409,8 +1490,6 @@ async def process_download_job(job: DownloadJob):
                 "--newline"
             ]
 
-            is_youtube = "youtube.com" in url or "youtu.be" in url
-
             if job.mode == "audio":
                 cmd = [
                     "yt-dlp",
@@ -1419,13 +1498,17 @@ async def process_download_job(job: DownloadJob):
                     "--audio-format", "mp3",
                     "--audio-quality", "0",
                     "--max-filesize", f"{MAX_FILE_SIZE_MB}M",
-                    "--match-filter", "duration <= 7200 & !is_live",
+                    "--match-filter", "duration <= 2700 & !is_live",
                     "--no-playlist",
                     "--no-write-thumbnail",
                     "--no-write-description",
                     "--no-write-info-json",
                     "--no-write-comments",
-                    "--socket-timeout", "15",
+                    "--concurrent-fragments", "5",
+                    "--socket-timeout", "30",
+                    "--retries", "10",
+                    "--fragment-retries", "10",
+                    "--buffersize", "1024K",
                     "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
                 if job.audio_format_id:
@@ -1435,23 +1518,15 @@ async def process_download_job(job: DownloadJob):
             else:
                 max_web_size = max(45, int(MAX_FILE_SIZE_MB * 0.95))
                 max_web_approx = max(40, int(MAX_FILE_SIZE_MB * 0.90))
-                yt_1080_limit = max(180, int(MAX_FILE_SIZE_MB * 0.90))
-                yt_720_limit = max(195, int(MAX_FILE_SIZE_MB * 0.98))
 
                 if is_youtube and job.audio_format_id:
-                    # Приоритет качества: 1080p -> 720p со склейкой выбранной аудиодорожки.
-                    # До 480p/360p опускаемся ТОЛЬКО если более высокое качество недоступно или превышает лимит.
-                    # КРИТИЧЕСКИ ВАЖНО: Никаких отдельных job.audio_format_id без видео!
+                    # Приоритет AVC/H.264 для мгновенной склейки без перекодирования!
                     format_rule = (
-                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{job.audio_format_id}/"
-                        f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{job.audio_format_id}/"
-                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
-                        f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
-                        f"bestvideo[height=720]+{job.audio_format_id}/"
-                        f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{job.audio_format_id}/"
+                        f"bestvideo[vcodec^=avc][height<=1080]+{job.audio_format_id}/"
+                        f"bestvideo[vcodec^=avc][height<=720]+{job.audio_format_id}/"
+                        f"bestvideo[vcodec^=avc]+{job.audio_format_id}/"
                         f"bestvideo[height<=720]+{job.audio_format_id}/"
                         f"bestvideo[height<=480]+{job.audio_format_id}/"
-                        f"bestvideo[height<=360]+{job.audio_format_id}/"
                         f"bestvideo+{job.audio_format_id}/"
                         f"best[height<=720]/"
                         "best"
@@ -1460,15 +1535,11 @@ async def process_download_job(job: DownloadJob):
                     # YouTube видео без ручного выбора дорожки (одиночный трек)
                     audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
                     format_rule = (
-                        f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
-                        f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
-                        f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
-                        f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
-                        f"bestvideo[height=720]+{audio_subrule}/"
-                        f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
+                        f"bestvideo[vcodec^=avc][height<=1080]+{audio_subrule}/"
+                        f"bestvideo[vcodec^=avc][height<=720]+{audio_subrule}/"
+                        f"bestvideo[vcodec^=avc]+{audio_subrule}/"
                         f"bestvideo[height<=720]+{audio_subrule}/"
                         f"bestvideo[height<=480]+{audio_subrule}/"
-                        f"bestvideo[height<=360]+{audio_subrule}/"
                         f"bestvideo+{audio_subrule}/"
                         f"best[height<=720]/"
                         "best"
@@ -1497,13 +1568,17 @@ async def process_download_job(job: DownloadJob):
                     *progress_args,
                     "--format", format_rule,
                     "--merge-output-format", "mp4",
-                    "--match-filter", "duration <= 7200 & !is_live",
+                    "--match-filter", "duration <= 2700 & !is_live",
                     *playlist_args,
                     "--no-write-thumbnail",
                     "--no-write-description",
                     "--no-write-info-json",
                     "--no-write-comments",
-                    "--socket-timeout", "15",
+                    "--concurrent-fragments", "5",
+                    "--socket-timeout", "30",
+                    "--retries", "10",
+                    "--fragment-retries", "10",
+                    "--buffersize", "1024K",
                     "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}"
                 ]
                 if not is_youtube:
@@ -1559,7 +1634,7 @@ async def process_download_job(job: DownloadJob):
                         if now - last_edit_time >= 2.0:
                             last_edit_time = now
                             try:
-                                await job.status_msg.edit_text("⚙️ <b>Склеиваю и подготавливаю медиа...</b>\n⏳ Ещё несколько секунд", parse_mode="HTML")
+                                await job.status_msg.edit_text("⚙️ <b>Склеиваю видео (это займет 1-2 мин)...</b>", parse_mode="HTML")
                             except Exception:
                                 pass
 
@@ -1575,8 +1650,11 @@ async def process_download_job(job: DownloadJob):
             stdout_task = asyncio.create_task(read_stdout(proc.stdout))
             stderr_task = asyncio.create_task(read_stderr(proc.stderr))
 
+            job_timeout = job.timeout or calculate_job_timeout(job.duration)
+            ytdlp_timeout = max(150.0, job_timeout - 25.0)
+
             try:
-                await asyncio.wait_for(asyncio.gather(stdout_task, stderr_task, proc.wait()), timeout=110.0)
+                await asyncio.wait_for(asyncio.gather(stdout_task, stderr_task, proc.wait()), timeout=ytdlp_timeout)
                 stderr_bytes = stderr_task.result() if stderr_task.done() else b""
             except asyncio.TimeoutError:
                 try:
@@ -1663,7 +1741,7 @@ async def process_download_job(job: DownloadJob):
             return
 
         try:
-            await job.status_msg.edit_text("📤 Отправляю файл...")
+            await job.status_msg.edit_text("🚀 Отправляю...")
         except Exception:
             pass
 
@@ -1716,7 +1794,12 @@ async def process_download_job(job: DownloadJob):
         # 2. Обычные видео
         if videos:
             for vid in videos:
-                vid = await ensure_h264(vid, status_msg=job.status_msg)
+                job_timeout = job.timeout or calculate_job_timeout(job.duration)
+                vid = await ensure_h264(vid, status_msg=job.status_msg, timeout=max(60.0, job_timeout - 40.0))
+                try:
+                    await job.status_msg.edit_text("🚀 Отправляю...")
+                except Exception:
+                    pass
                 file_size = os.path.getsize(vid)
                 file_size_mb = round(file_size / (1024 * 1024), 1)
 
@@ -1989,13 +2072,15 @@ async def download_worker(worker_id: int):
 
         asyncio.create_task(notify_queue_positions())
 
+        job_timeout = job.timeout or calculate_job_timeout(job.duration)
         try:
-            await asyncio.wait_for(process_download_job(job), timeout=120.0)
+            await asyncio.wait_for(process_download_job(job), timeout=job_timeout)
         except asyncio.TimeoutError:
-            logging.error(f"Job timeout for url: {job.url}")
+            logging.error(f"Job timeout for url: {job.url} (timeout: {job_timeout}s)")
             await increment_stat("failed")
+            timeout_mins = int(round(job_timeout / 60))
             try:
-                await job.status_msg.edit_text("⚠️ Таймаут: сервер источника отдает поток слишком медленно (лимит 2 мин).")
+                await job.status_msg.edit_text(f"⚠️ Таймаут: сервер источника отдает поток слишком медленно (лимит {timeout_mins} мин).")
             except Exception:
                 pass
         except Exception as e:
@@ -2260,7 +2345,8 @@ def _extract_youtube_info_sync(url: str) -> dict | None:
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "socket_timeout": 10,
+        "socket_timeout": 20,
+        "retries": 5,
     }
     if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
         ydl_opts["cookiefile"] = COOKIES_PATH
@@ -2271,23 +2357,24 @@ def _extract_youtube_info_sync(url: str) -> dict | None:
         logging.warning(f"_extract_youtube_info_sync error: {e}")
         return None
 
-async def get_youtube_audio_tracks(url: str) -> tuple[str, list[dict], dict | None]:
-    """Анализирует форматы YouTube. Если доступно несколько языковых аудиодорожек, возвращает (title, tracks, default_track)."""
+async def get_youtube_audio_tracks(url: str) -> tuple[str, list[dict], dict | None, float | None]:
+    """Анализирует форматы YouTube. Если доступно несколько языковых аудиодорожек, возвращает (title, tracks, default_track, duration)."""
     try:
         info = await asyncio.to_thread(_extract_youtube_info_sync, url)
     except Exception as e:
         logging.warning(f"Failed to get YouTube audio info: {e}")
-        return "", [], None
+        return "", [], None, None
 
     if not info:
-        return "", [], None
+        return "", [], None, None
 
     title = info.get("title") or "YouTube Video"
+    duration = info.get("duration")
     formats = info.get("formats", [])
     audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
 
     if not audio_formats:
-        return title, [], None
+        return title, [], None, duration
 
     by_lang: dict[str, dict] = {}
     for f in audio_formats:
@@ -2325,7 +2412,7 @@ async def get_youtube_audio_tracks(url: str) -> tuple[str, list[dict], dict | No
 
     # Если звуковая дорожка всего одна — интерактивное меню не требуется
     if len(by_lang) <= 1:
-        return title, [], None
+        return title, [], None, duration
 
     tracks: list[dict] = []
     default_track = None
@@ -2373,7 +2460,7 @@ async def get_youtube_audio_tracks(url: str) -> tuple[str, list[dict], dict | No
         return (3, t.get("label", ""))
 
     tracks.sort(key=sort_key)
-    return title, tracks, default_track
+    return title, tracks, default_track, duration
 
 def build_youtube_audio_keyboard(session_id: str, tracks: list[dict]) -> InlineKeyboardMarkup:
     rows = []
@@ -2427,7 +2514,8 @@ async def handle_youtube_audio_timeout(session_id: str, delay: int = 90):
         mode=session["mode"],
         status_msg=status_msg,
         audio_format_id=default_track.get("format_id"),
-        track_name=label
+        track_name=label,
+        duration=session.get("duration")
     )
 
 @dp.callback_query(F.data.startswith("ytaudio:"))
@@ -2485,7 +2573,8 @@ async def youtube_audio_callback(callback: CallbackQuery):
         mode=session["mode"],
         status_msg=status_msg,
         audio_format_id=chosen_track.get("format_id"),
-        track_name=label
+        track_name=label,
+        duration=session.get("duration")
     )
 
 # --- ОЧЕРЕДЬ И ВАЛИДАЦИЯ ---
@@ -2496,7 +2585,8 @@ async def enqueue_job(
     mode: str = "auto",
     status_msg: Message | None = None,
     audio_format_id: str | None = None,
-    track_name: str | None = None
+    track_name: str | None = None,
+    duration: float | None = None
 ):
     user_id = message.from_user.id
     current_queue_len = len(QUEUE_JOBS)
@@ -2541,7 +2631,9 @@ async def enqueue_job(
             mode=mode,
             last_status_text=status_text,
             audio_format_id=audio_format_id,
-            track_name=track_name
+            track_name=track_name,
+            duration=duration,
+            timeout=calculate_job_timeout(duration)
         )
         QUEUE_JOBS.append(job)
         await DOWNLOAD_QUEUE.put(job)
@@ -2586,7 +2678,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
 
     is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
 
-    # Для YouTube проверяем наличие нескольких аудиодорожек (Multi-Audio Tracks)
+    # Для YouTube проверяем наличие нескольких аудиодорожек (Multi-Audio Tracks) и длительность
     if is_youtube:
         try:
             status_msg = await message.answer("🔍 Анализирую ссылку YouTube...")
@@ -2596,10 +2688,20 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
             return
 
         try:
-            title, tracks, default_track = await get_youtube_audio_tracks(url)
+            title, tracks, default_track, duration = await get_youtube_audio_tracks(url)
         except Exception as e:
             logging.warning(f"Error checking YouTube audio tracks: {e}")
-            title, tracks, default_track = "", [], None
+            title, tracks, default_track, duration = "", [], None, None
+
+        # Проверка длительности: лимит 45 минут
+        if duration and duration > 2700:
+            try:
+                await status_msg.edit_text("⚠️ Видео слишком длинное (лимит 45 минут), чтобы не перегружать сервер.")
+            except Exception:
+                pass
+            USER_ACTIVE_COUNT[user_id] = max(0, USER_ACTIVE_COUNT.get(user_id, 1) - 1)
+            USER_ACTIVE_TIMESTAMP.pop(user_id, None)
+            return
 
         if len(tracks) > 1:
             session_id = uuid.uuid4().hex[:8]
@@ -2612,6 +2714,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                 "title": title,
                 "tracks": tracks,
                 "default_track": default_track,
+                "duration": duration,
                 "created_at": time.time(),
                 "timeout_task": None
             }
@@ -2630,11 +2733,11 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
             except Exception as e:
                 logging.warning(f"Failed to show audio selection menu: {e}")
                 YOUTUBE_AUDIO_SESSIONS.pop(session_id, None)
-                await enqueue_job(message, url, mode, status_msg=status_msg)
+                await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
             return
 
         # Если дорожка всего одна (или ошибка анализа) — сразу запускаем стандартное скачивание
-        await enqueue_job(message, url, mode, status_msg=status_msg)
+        await enqueue_job(message, url, mode, status_msg=status_msg, duration=duration)
         return
 
     # Для всех остальных сервисов (TikTok, Reels, VK, Reddit и др.) — стандартная отправка в очередь
@@ -3026,18 +3129,12 @@ async def download_for_inline(url: str) -> dict | None:
 
             if is_youtube:
                 audio_subrule = "(bestaudio[language=ru][ext=m4a]/bestaudio[language=ru]/bestaudio[format_note*=original][ext=m4a]/bestaudio[format_note*=original]/bestaudio[language_preference>0]/bestaudio[ext=m4a]/bestaudio)"
-                yt_1080_limit = max(180, int(MAX_FILE_SIZE_MB * 0.90))
-                yt_720_limit = max(195, int(MAX_FILE_SIZE_MB * 0.98))
                 format_rule = (
-                    f"bestvideo[height=1080][vcodec^=avc][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
-                    f"bestvideo[height=1080][filesize_approx<{yt_1080_limit}M]+{audio_subrule}/"
-                    f"bestvideo[height=720][vcodec^=avc][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
-                    f"bestvideo[height=720][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
-                    f"bestvideo[height=720]+{audio_subrule}/"
-                    f"bestvideo[height<=1080][filesize_approx<{yt_720_limit}M]+{audio_subrule}/"
+                    f"bestvideo[vcodec^=avc][height<=1080]+{audio_subrule}/"
+                    f"bestvideo[vcodec^=avc][height<=720]+{audio_subrule}/"
+                    f"bestvideo[vcodec^=avc]+{audio_subrule}/"
                     f"bestvideo[height<=720]+{audio_subrule}/"
                     f"bestvideo[height<=480]+{audio_subrule}/"
-                    f"bestvideo[height<=360]+{audio_subrule}/"
                     f"bestvideo+{audio_subrule}/"
                     f"best[height<=720]/"
                     "best"
@@ -3063,7 +3160,11 @@ async def download_for_inline(url: str) -> dict | None:
                 "--no-write-thumbnail",
                 "--no-write-description",
                 "--no-write-info-json",
-                "--socket-timeout", "15",
+                "--concurrent-fragments", "5",
+                "--socket-timeout", "30",
+                "--retries", "10",
+                "--fragment-retries", "10",
+                "--buffersize", "1024K",
                 "--postprocessor-args", f"ffmpeg:-threads {FFMPEG_THREADS}",
                 url
             ]
