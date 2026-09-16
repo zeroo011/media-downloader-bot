@@ -1971,9 +1971,14 @@ async def process_download_job(job: DownloadJob):
                             except Exception:
                                 pass
                     else:
-                        media = [InputMediaPhoto(media=FSInputFile(p)) for p in chunk]
-                        if i == 0:
-                            media[0].caption = f"🖼 Фото-карусель ({len(photos)} фото) готова."
+                        caption_text = f"🖼 Фото-карусель ({len(photos)} фото) готова." if i == 0 else None
+                        media = [
+                            InputMediaPhoto(
+                                media=FSInputFile(p),
+                                caption=caption_text if p_idx == 0 else None
+                            )
+                            for p_idx, p in enumerate(chunk)
+                        ]
                         try:
                             sent_msgs = await job.message.answer_media_group(media=media)
                             if sent_msgs:
