@@ -21,6 +21,8 @@ import aiohttp
 from aiohttp import web
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -70,7 +72,7 @@ if not TOKEN:
     logging.error("BOT_TOKEN не задан!")
     sys.exit(1)
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 DOWNLOAD_QUEUE: asyncio.Queue = asyncio.Queue(maxsize=50)
@@ -2868,7 +2870,7 @@ async def handle_youtube_session_timeout(session_id: str, delay: int = 60):
 
     timeout_details = []
     if audio_label and len(tracks) > 1:
-        timeout_details.append(f"звук: {audio_label}")
+        timeout_details.append(f"звук: {html.escape(str(audio_label))}")
     if best_height and session.get("mode") != "audio":
         timeout_details.append(f"качество: {best_height}p")
     detail_str = f" ({', '.join(timeout_details)})" if timeout_details else ""
@@ -2878,6 +2880,7 @@ async def handle_youtube_session_timeout(session_id: str, delay: int = 60):
             f"🎬 <b>{html.escape(title)}</b>\n\n"
             f"⏱ <i>Время выбора истекло. Автовыбор{detail_str}.</i>\n"
             f"⏳ Начинаю загрузку...",
+            parse_mode="HTML",
             reply_markup=None
         )
     except Exception:
@@ -2931,9 +2934,10 @@ async def youtube_audio_callback(callback: CallbackQuery):
         try:
             await status_msg.edit_text(
                 f"🎬 <b>{html.escape(title)}</b>\n\n"
-                f"🔊 Озвучка: <b>{label}</b>\n"
+                f"🔊 Озвучка: <b>{html.escape(str(label))}</b>\n"
                 f"📹 Качество: <b>{best_height}p</b>\n"
                 f"⏳ Начинаю загрузку...",
+                parse_mode="HTML",
                 reply_markup=None
             )
         except Exception:
@@ -2975,8 +2979,9 @@ async def youtube_audio_callback(callback: CallbackQuery):
         try:
             await status_msg.edit_text(
                 f"🎬 <b>{html.escape(title)}</b>\n\n"
-                f"🔊 Озвучка: <b>{label}</b>\n"
+                f"🔊 Озвучка: <b>{html.escape(str(label))}</b>\n"
                 f"⏳ Начинаю загрузку аудио...",
+                parse_mode="HTML",
                 reply_markup=None
             )
         except Exception:
@@ -3020,9 +3025,10 @@ async def youtube_audio_callback(callback: CallbackQuery):
     try:
         await status_msg.edit_text(
             f"🎬 <b>{html.escape(title)}</b>\n\n"
-            f"🔊 Озвучка: <b>{label}</b>\n"
+            f"🔊 Озвучка: <b>{html.escape(str(label))}</b>\n"
             f"📹 <b>Шаг 2 из 2: Выбери качество видео:</b>\n\n"
             f"<i>⏳ Автовыбор лучшего через 1 мин.</i>",
+            parse_mode="HTML",
             reply_markup=kb
         )
     except Exception as e:
@@ -3070,8 +3076,8 @@ async def youtube_quality_callback(callback: CallbackQuery):
 
     details = []
     if audio_label and len(session.get("tracks", [])) > 1:
-        details.append(f"🔊 Озвучка: <b>{audio_label}</b>")
-    details.append(f"📹 Качество: <b>{label_q}</b>")
+        details.append(f"🔊 Озвучка: <b>{html.escape(str(audio_label))}</b>")
+    details.append(f"📹 Качество: <b>{html.escape(str(label_q))}</b>")
     details_str = "\n".join(details)
 
     try:
@@ -3079,6 +3085,7 @@ async def youtube_quality_callback(callback: CallbackQuery):
             f"🎬 <b>{html.escape(title)}</b>\n\n"
             f"{details_str}\n"
             f"⏳ Начинаю загрузку...",
+            parse_mode="HTML",
             reply_markup=None
         )
     except Exception:
@@ -3267,6 +3274,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                         f"🔊 <b>Найдено несколько звуковых дорожек.</b>\n"
                         f"Выбери желаемый язык озвучки:\n\n"
                         f"<i>⏳ Автовыбор оригинала через 1.5 мин.</i>",
+                        parse_mode="HTML",
                         reply_markup=kb
                     )
                 except Exception as e:
@@ -3313,6 +3321,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                     f"🔊 <b>Шаг 1 из 2: Найдено несколько звуковых дорожек.</b>\n"
                     f"Выбери желаемый язык озвучки:\n\n"
                     f"<i>⏳ Автовыбор оригинала через 1.5 мин.</i>",
+                    parse_mode="HTML",
                     reply_markup=kb
                 )
             except Exception as e:
@@ -3349,6 +3358,7 @@ async def queue_download(message: Message, url: str, mode: str = "auto"):
                     f"🎬 <b>{html.escape(title)}</b>\n\n"
                     f"📹 <b>Выбери качество видео:</b>\n\n"
                     f"<i>⏳ Автовыбор лучшего качества через 1 мин.</i>",
+                    parse_mode="HTML",
                     reply_markup=kb
                 )
             except Exception as e:
