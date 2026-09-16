@@ -1396,31 +1396,39 @@ async def download_twitter_media(url: str, task_dir: str) -> bool:
                 videos = media.get("videos", [])
 
                 if photos:
+                    dl_count = 0
                     for idx, p in enumerate(photos[:25]):
                         p_url = p.get("url")
                         if p_url:
-                            async with session.get(p_url) as p_resp:
-                                if p_resp.status == 200:
-                                    content = await p_resp.read()
-                                    with open(f"{task_dir}/{idx:02d}_twitter.jpg", "wb") as f:
-                                        f.write(content)
-                    return True
+                            try:
+                                async with session.get(p_url, timeout=aiohttp.ClientTimeout(total=15)) as p_resp:
+                                    if p_resp.status == 200:
+                                        content = await p_resp.read()
+                                        if content:
+                                            with open(f"{task_dir}/{idx:02d}_twitter.jpg", "wb") as f:
+                                                f.write(content)
+                                            dl_count += 1
+                            except Exception as pe:
+                                logging.warning(f"Twitter photo download error: {pe}")
+                    return dl_count > 0
 
                 if videos:
                     v_url = videos[0].get("url")
                     if v_url:
-                        async with session.get(v_url) as v_resp:
+                        async with session.get(v_url, timeout=aiohttp.ClientTimeout(total=30)) as v_resp:
                             if v_resp.status == 200:
                                 content = await v_resp.read()
-                                with open(f"{task_dir}/video.mp4", "wb") as f:
-                                    f.write(content)
-                                return True
+                                if content:
+                                    with open(f"{task_dir}/video.mp4", "wb") as f:
+                                        f.write(content)
+                                    return True
     except Exception as e:
         logging.error(f"Twitter media download error: {e}")
     return False
 
 async def download_tiktok_api(url: str, task_dir: str) -> bool:
-    api_url = f"https://www.tikwm.com/api/?url={url}"
+    encoded_url = urllib.parse.quote(url, safe="")
+    api_url = f"https://www.tikwm.com/api/?url={encoded_url}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"
     }
@@ -1438,28 +1446,39 @@ async def download_tiktok_api(url: str, task_dir: str) -> bool:
                 music = payload.get("music")
 
                 if images:
+                    downloaded_imgs = 0
                     for i, img_url in enumerate(images[:25]):
-                        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=10)) as img_resp:
-                            if img_resp.status == 200:
-                                content = await img_resp.read()
-                                with open(f"{task_dir}/{i:02d}_photo.jpg", "wb") as f:
-                                    f.write(content)
+                        try:
+                            async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=12)) as img_resp:
+                                if img_resp.status == 200:
+                                    content = await img_resp.read()
+                                    if content:
+                                        with open(f"{task_dir}/{i:02d}_photo.jpg", "wb") as f:
+                                            f.write(content)
+                                        downloaded_imgs += 1
+                        except Exception as ie:
+                            logging.warning(f"TikWM image {i} download error: {ie}")
                     if music:
-                        async with session.get(music, timeout=aiohttp.ClientTimeout(total=10)) as mus_resp:
-                            if mus_resp.status == 200:
-                                content = await mus_resp.read()
-                                with open(f"{task_dir}/audio.mp3", "wb") as f:
-                                    f.write(content)
-                    return True
+                        try:
+                            async with session.get(music, timeout=aiohttp.ClientTimeout(total=12)) as mus_resp:
+                                if mus_resp.status == 200:
+                                    content = await mus_resp.read()
+                                    if content:
+                                        with open(f"{task_dir}/audio.mp3", "wb") as f:
+                                            f.write(content)
+                        except Exception as me:
+                            logging.warning(f"TikWM music download error: {me}")
+                    return downloaded_imgs > 0
 
                 play_url = payload.get("play")
                 if play_url:
                     async with session.get(play_url, timeout=aiohttp.ClientTimeout(total=30)) as vid_resp:
                         if vid_resp.status == 200:
                             content = await vid_resp.read()
-                            with open(f"{task_dir}/video.mp4", "wb") as f:
-                                f.write(content)
-                            return True
+                            if content:
+                                with open(f"{task_dir}/video.mp4", "wb") as f:
+                                    f.write(content)
+                                return True
     except Exception as e:
         logging.error(f"TikWM API error: {e}")
     return False
@@ -1532,8 +1551,8 @@ async def process_download_job(job: DownloadJob):
         if not downloaded and any(d in url for d in ["twitter.com", "x.com"]) and job.mode != "round":
             downloaded = await download_twitter_media(url, task_dir)
 
-        # 5. TikTok фото-карусель
-        if not downloaded and is_tiktok and ("/photo/" in url) and job.mode != "round":
+        # 5. TikTok (фото-карусели и видео без водяных знаков)
+        if not downloaded and is_tiktok and job.mode != "round":
             downloaded = await download_tiktok_api(url, task_dir)
 
         # 6. yt-dlp загрузка с живым интерактивным прогресс-баром
@@ -1739,12 +1758,12 @@ async def process_download_job(job: DownloadJob):
                 logging.warning(f"yt-dlp failed (code {proc.returncode}) for {url}:\n{last_ytdlp_error}")
 
         found_files = sorted(glob.glob(f"{task_dir}/*"))
-        valid_files = [f for f in found_files if not f.endswith(('.part', '.ytdl', '.temp')) and os.path.isfile(f)]
+        valid_files = [f for f in found_files if not f.endswith(('.part', '.ytdl', '.temp')) and os.path.isfile(f) and os.path.getsize(f) > 0]
 
         if not valid_files and is_tiktok and job.mode != "round":
             await download_tiktok_api(url, task_dir)
             found_files = sorted(glob.glob(f"{task_dir}/*"))
-            valid_files = [f for f in found_files if not f.endswith(('.part', '.ytdl', '.temp')) and os.path.isfile(f)]
+            valid_files = [f for f in found_files if not f.endswith(('.part', '.ytdl', '.temp')) and os.path.isfile(f) and os.path.getsize(f) > 0]
 
         if not valid_files:
             error_message = parse_ytdlp_error(last_ytdlp_error)
@@ -1860,7 +1879,135 @@ async def process_download_job(job: DownloadJob):
                 await increment_stat("failed")
                 return
 
-        # 2. Обычные видео
+        # 2. Режим аудио (/audio <url>)
+        if job.mode == "audio":
+            if audios:
+                for aud in audios:
+                    base_name = os.path.basename(aud)
+                    file_size = os.path.getsize(aud)
+                    file_size_mb = round(file_size / (1024 * 1024), 1)
+
+                    if file_size <= MAX_TG_FILE_SIZE_BYTES:
+                        await bot.send_chat_action(job.message.chat.id, "upload_voice")
+                        audio_file = FSInputFile(aud)
+                        audio_msg = await job.message.answer_audio(audio=audio_file, caption="🎵 Аудиодорожка")
+                        if audio_msg and audio_msg.audio:
+                            await save_media_cache(job.url, audio_msg.audio.file_id, "audio", base_name)
+                        await increment_stat("success")
+                    elif file_size <= MAX_WEB_FILE_SIZE_BYTES:
+                        token = uuid.uuid4().hex[:16]
+                        dest_file = f"{WEB_DOWNLOADS_DIR}/{token}_{base_name}"
+                        shutil.copy2(aud, dest_file)
+
+                        DOWNLOAD_LINKS[token] = {
+                            "path": dest_file,
+                            "filename": base_name,
+                            "expire_at": time.time() + WEB_TTL_SECONDS,
+                            "size_mb": file_size_mb,
+                            "user_id": job.user_id
+                        }
+                        clean_url_filename = urllib.parse.quote(base_name)
+                        download_url = f"{WEB_BASE_URL}/dl/{token}/{clean_url_filename}"
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text=f"📥 Скачать MP3 ({file_size_mb} МБ)", url=download_url)]
+                        ])
+                        await job.message.answer(
+                            f"🎵 <b>Аудио готово!</b>\n\nРазмер: <b>{file_size_mb} МБ</b> (больше 50 МБ).\n"
+                            f"🔗 <a href='{download_url}'>Скачать напрямую с сервера</a>\n\n"
+                            f"⏳ <i>Ссылка действует 7 минут.</i>",
+                            parse_mode="HTML",
+                            reply_markup=kb
+                        )
+                        await increment_stat("success")
+                    else:
+                        await job.message.answer(f"⚠️ Аудиофайл ({file_size_mb} МБ) превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ).")
+                        await increment_stat("failed")
+            try:
+                await job.status_msg.delete()
+            except Exception:
+                pass
+            return
+
+        # 3. Фото и фото-карусели (включая прикрепленную музыку/звук)
+        if photos:
+            if len(photos) == 1:
+                photo_file = FSInputFile(photos[0])
+                base_name = os.path.basename(photos[0])
+                cache_id = uuid.uuid4().hex[:12]
+                cached_file = f"{CACHE_DIR}/{cache_id}_{base_name}"
+                shutil.copy2(photos[0], cached_file)
+                CONVERT_CACHE[cache_id] = {
+                    "path": cached_file,
+                    "filename": base_name,
+                    "expire_at": time.time() + CACHE_TTL_SECONDS,
+                    "user_id": job.user_id
+                }
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📁 Файлом (без сжатия)", callback_data=f"ext_doc:{cache_id}")]
+                ])
+                try:
+                    photo_msg = await job.message.answer_photo(photo=photo_file, caption="🖼 Готово.", reply_markup=kb)
+                    if photo_msg and photo_msg.photo:
+                        await save_media_cache(job.url, photo_msg.photo[-1].file_id, "photo", base_name)
+                except Exception as e:
+                    logging.warning(f"answer_photo failed for {photos[0]}: {e}. Trying document fallback.")
+                    try:
+                        await job.message.answer_document(document=photo_file, caption="🖼 Готово.")
+                    except Exception:
+                        pass
+            else:
+                all_file_ids = []
+                for i in range(0, len(photos), 10):
+                    chunk = photos[i:i + 10]
+                    if len(chunk) == 1:
+                        try:
+                            p_msg = await job.message.answer_photo(photo=FSInputFile(chunk[0]))
+                            if p_msg and p_msg.photo:
+                                all_file_ids.append(p_msg.photo[-1].file_id)
+                        except Exception as e:
+                            logging.warning(f"Single photo chunk failed: {e}")
+                            try:
+                                await job.message.answer_document(document=FSInputFile(chunk[0]))
+                            except Exception:
+                                pass
+                    else:
+                        media = [InputMediaPhoto(media=FSInputFile(p)) for p in chunk]
+                        if i == 0:
+                            media[0].caption = f"🖼 Фото-карусель ({len(photos)} фото) готова."
+                        try:
+                            sent_msgs = await job.message.answer_media_group(media=media)
+                            if sent_msgs:
+                                for sm in sent_msgs:
+                                    if sm.photo:
+                                        all_file_ids.append(sm.photo[-1].file_id)
+                        except Exception as group_err:
+                            logging.warning(f"answer_media_group failed: {group_err}. Falling back to individual photos.")
+                            for p_idx, p in enumerate(chunk):
+                                try:
+                                    cap = f"🖼 Фото-карусель ({len(photos)} фото) готова." if (i == 0 and p_idx == 0) else None
+                                    p_msg = await job.message.answer_photo(photo=FSInputFile(p), caption=cap)
+                                    if p_msg and p_msg.photo:
+                                        all_file_ids.append(p_msg.photo[-1].file_id)
+                                except Exception as photo_err:
+                                    logging.warning(f"Individual photo fallback failed for {p}: {photo_err}")
+                                    try:
+                                        await job.message.answer_document(document=FSInputFile(p))
+                                    except Exception:
+                                        pass
+
+                if all_file_ids:
+                    await save_media_cache(job.url, json.dumps(all_file_ids), "photos", f"Карусель ({len(all_file_ids)} фото)")
+
+            # Если к публикации с фото прикреплена музыка/звук (TikTok, Reels, VK и др.)
+            for aud in audios:
+                try:
+                    await job.message.answer_audio(audio=FSInputFile(aud), caption="🎵 Звук из публикации")
+                except Exception as ae:
+                    logging.warning(f"Failed to send publication audio {aud}: {ae}")
+
+            await increment_stat("success")
+
+        # 4. Обычные видео
         if videos:
             for vid in videos:
                 job_timeout = job.timeout or calculate_job_timeout(job.duration)
@@ -2006,7 +2153,8 @@ async def process_download_job(job: DownloadJob):
                     )
                     await increment_stat("failed")
 
-        elif audios:
+        # 5. Только аудио (когда в публикации нет ни видео, ни фото)
+        elif audios and not photos:
             # Защита: если для видео с YouTube по какой-то причине отсутствует видеофайл в обычном режиме, не отправлять голый звук!
             if is_youtube and job.mode != "audio":
                 logging.warning(f"YouTube job in mode {job.mode} produced only audio without video: {audios}")
@@ -2057,54 +2205,6 @@ async def process_download_job(job: DownloadJob):
                 else:
                     await job.message.answer(f"⚠️ Аудиофайл ({file_size_mb} МБ) превышает лимит сервера ({MAX_FILE_SIZE_MB} МБ).")
                     await increment_stat("failed")
-
-        elif photos:
-            if len(photos) == 1:
-                photo_file = FSInputFile(photos[0])
-                base_name = os.path.basename(photos[0])
-                cache_id = uuid.uuid4().hex[:12]
-                cached_file = f"{CACHE_DIR}/{cache_id}_{base_name}"
-                shutil.copy2(photos[0], cached_file)
-                CONVERT_CACHE[cache_id] = {
-                    "path": cached_file,
-                    "filename": base_name,
-                    "expire_at": time.time() + CACHE_TTL_SECONDS,
-                    "user_id": job.user_id
-                }
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📁 Файлом (без сжатия)", callback_data=f"ext_doc:{cache_id}")]
-                ])
-                photo_msg = await job.message.answer_photo(photo=photo_file, caption="🖼 Готово.", reply_markup=kb)
-                if photo_msg and photo_msg.photo:
-                    await save_media_cache(job.url, photo_msg.photo[-1].file_id, "photo", base_name)
-            else:
-                all_file_ids = []
-                for i in range(0, len(photos), 10):
-                    chunk = photos[i:i + 10]
-                    if len(chunk) == 1:
-                        p_msg = await job.message.answer_photo(photo=FSInputFile(chunk[0]))
-                        if p_msg and p_msg.photo:
-                            all_file_ids.append(p_msg.photo[-1].file_id)
-                    else:
-                        media = [InputMediaPhoto(media=FSInputFile(p)) for p in chunk]
-                        if i == 0:
-                            media[0].caption = f"🖼 Фото-карусель ({len(photos)} фото) готова."
-                        sent_msgs = await job.message.answer_media_group(media=media)
-                        if sent_msgs:
-                            for sm in sent_msgs:
-                                if sm.photo:
-                                    all_file_ids.append(sm.photo[-1].file_id)
-
-                if all_file_ids:
-                    await save_media_cache(job.url, json.dumps(all_file_ids), "photos", f"Карусель ({len(all_file_ids)} фото)")
-
-            for aud in audios:
-                try:
-                    await job.message.answer_audio(audio=FSInputFile(aud), caption="🎵 Звук из публикации")
-                except Exception:
-                    pass
-
-            await increment_stat("success")
 
         try:
             await job.status_msg.delete()
